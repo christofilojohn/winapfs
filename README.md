@@ -10,7 +10,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/christofilojohn/winapfs/releases"><img alt="Release" src="https://img.shields.io/github/v/release/christofilojohn/winapfs?include_prereleases&label=release"></a>
+  <a href="https://github.com/FOLKGG/winapfs/releases"><img alt="Release" src="https://img.shields.io/github/v/release/FOLKGG/winapfs?include_prereleases&label=release"></a>
+  <a href="https://github.com/FOLKGG/winapfs/actions/workflows/build.yml"><img alt="Build Windows" src="https://github.com/FOLKGG/winapfs/actions/workflows/build.yml/badge.svg"></a>
+  <a href="https://github.com/FOLKGG/winapfs/actions/workflows/fsck-apfs.yml"><img alt="macOS fsck_apfs" src="https://github.com/FOLKGG/winapfs/actions/workflows/fsck-apfs.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="Licence: GPL-2.0" src="https://img.shields.io/badge/licence-GPL--2.0-blue"></a>
   <img alt="Windows 10/11 x64" src="https://img.shields.io/badge/Windows-10%20%7C%2011%20x64-0078d4">
   <img alt="Status: beta" src="https://img.shields.io/badge/status-beta-orange">
@@ -65,17 +67,18 @@ no driver signing, nothing proprietary.
 |---|---|
 | Reading (files, metadata, xattrs, links, compression) | ✅ Stable, checked against manifests made on macOS |
 | Encrypted volumes | ✅ Read-only |
-| Writing to unencrypted volumes | 🧪 Experimental. Passes its own crash and consistency tests; the macOS `fsck_apfs` check of disks written by winapfs is still pending |
+| Writing to unencrypted volumes | 🧪 Experimental. Passes crash/consistency tests, and `winapfs`-written test images (`basic`, `compressed`, `links`, `casesensitive`) are validated in CI with Apple's `fsck_apfs -n -l` and macOS read-only mounts; physical-disk writes remain opt-in and experimental |
 | Writing to encrypted volumes, snapshots | ⏳ Planned |
 | Fusion drives, Time Machine and macOS system volumes (writing) | ⛔ Refused (read-only) |
 
 ## Install
 
-1. Install **[WinFsp](https://winfsp.dev/rel/)** (2.x).
-2. Download **`winapfs-<version>-x64.msi`** from
-   [Releases](https://github.com/christofilojohn/winapfs/releases) and run it.
-   The installer is not code-signed yet, so SmartScreen may ask you to confirm
-   ("More info" → "Run anyway").
+Download builds from [Releases](https://github.com/FOLKGG/winapfs/releases) (or the latest build artifacts from [GitHub Actions](https://github.com/FOLKGG/winapfs/actions/workflows/build.yml)):
+
+* **All-in-one installer (recommended):** download **`winapfs-<version>-x64-setup.exe`** (`winapfs-setup-x64` artifact) and run it. It installs **WinFsp 2.2** and **winapfs** in one step (uninstalling winapfs later leaves WinFsp intact).
+* **Standalone MSI** (if you already have **[WinFsp](https://winfsp.dev/rel/)** 2.x installed): download and run **`winapfs-<version>-x64.msi`** (`winapfs-msi-x64` artifact).
+
+The installers are not code-signed yet, so SmartScreen may ask you to confirm ("More info" → "Run anyway").
 
 The installer adds the `winapfs` service (starts with Windows), the tray app,
 and the command-line tools (on `PATH`). Connect an APFS disk and it appears as a
@@ -171,18 +174,30 @@ contents and metadata:
   (including a simulated volatile disk cache) and require a clean `fsck` and
   the last synced state, intact;
 - regression tests for long copies, disk-full, memory bounds and the
-  installer's service.
+  installer's service;
+- **cross-OS macOS `fsck_apfs` validation** (`.github/workflows/fsck-apfs.yml`):
+  generates macOS APFS images (`basic`, `compressed`, `links`, `casesensitive`),
+  runs `apfsrw-writetest` and `winapfs-fsck -c` on Windows, then sends the
+  written images back to macOS to verify them with Apple's `fsck_apfs -n -l`
+  and read-only `hdiutil` mounts.
 
 ## Build from source
 
 Requirements: Visual Studio 2022 Build Tools (C++ workload), CMake ≥ 3.20,
-WinFsp with its developer files. The installer needs the WiX Toolset 5.
+WinFsp with its developer files (`ADDLOCAL=ALL`). The installers need WiX
+Toolset 5 (`WixToolset.UI.wixext`, `WixToolset.Util.wixext`, and
+`WixToolset.BootstrapperApplications.wixext` for the setup bundle).
 
 ```powershell
 build.cmd Release                                     # configure and build (x64)
 ctest --test-dir build -C Release --output-on-failure # needs the test images
 powershell -File installer\build.ps1                  # dist\winapfs-<version>-x64.msi
+powershell -File installer\build.ps1 -WinFspMsi path\to\winfsp.msi  # also builds dist\winapfs-<version>-x64-setup.exe
 ```
+
+GitHub Actions (`.github/workflows/build.yml`) automates Release builds, unit
+tests (`unit.names`), and both `.msi` and `-setup.exe` installers on
+`windows-2022`.
 
 The test images (2.7 GB) are not in the repository. Make them on a Mac with
 `testdata/generator` (see its README); `testdata/SHA256SUMS` lists the
@@ -190,7 +205,9 @@ expected checksums.
 
 ## Credits
 
-winapfs stands on the work of these projects. Thank you.
+This repository is a maintained fork of
+[christofilojohn/winapfs](https://github.com/christofilojohn/winapfs). winapfs
+stands on the work of these projects. Thank you.
 
 | Project | Used for | Licence |
 |---|---|---|
@@ -213,10 +230,10 @@ documents the on-disk format.
 
 winapfs is experimental software provided **"as is", without warranty of any
 kind**, express or implied, including fitness for a particular purpose. Writing
-to APFS volumes is experimental and has not yet been validated by Apple's own
-`fsck_apfs`; reading has been tested extensively, but no file system driver is
-free of bugs. **You use winapfs at your own risk**: the authors and contributors
-are not liable for any loss or corruption of data, or any other damage, arising
+to APFS volumes is experimental (cross-OS CI validates written test images
+against Apple's `fsck_apfs`, while real-world disk testing is ongoing); reading
+has been tested extensively, but no file system driver is free of bugs. **You
+use winapfs at your own risk**: the authors and contributors are not liable for any loss or corruption of data, or any other damage, arising
 from its use (GPL-2.0, sections 11 and 12). Keep backups, eject disks properly
 before unplugging them, and do not write to a disk you cannot afford to lose.
 
