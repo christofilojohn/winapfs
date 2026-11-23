@@ -1,0 +1,195 @@
+name: macOS fsck_apfs Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/kshim/**'
+      - 'src/core/**'
+      - 'src/mount/**'
+      - 'third_party/linux-apfs-rw/**'
+      - 'tests/writetest.cpp'
+      - '.github/workflows/fsck-apfs.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  generate-images:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate real macOS APFS images and manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d -t winapfs-gen)"
+          OUT="$PWD/generated"
+          DISK=""
+          cleanup() {
+            [[ -n "$DISK" ]] && hdiutil detach -force "$DISK" >/dev/null 2>&1 || true
+            rm -rf "$WORK"
+          }
+          trap cleanup EXIT
+          mkdir -p "$OUT" "$WORK/mnt" "$WORK/ro"
+
+          make_one() {
+            local name=$1 size=$2 fs=$3 vol=$4 profile=$5
+            echo "=== Generating $name.img ($fs / $vol) ==="
+            hdiutil create -quiet -size "$size" -fs "$fs" -volname "$vol" -layout GPTSPUD "$WORK/$name.dmg"
+            local out mp
+            out=$(hdiutil attach -nobrowse -owners on -mountroot "$WORK/mnt" "$WORK/$name.dmg" 2>/dev/null)
+            DISK=$(awk '$2 == "GUID_partition_scheme" {print $1; exit}' <<<"$out")
+            [[ -n "$DISK" ]] || DISK=$(awk 'NR==1{print $1}' <<<"$out")
+            mp=$(cd "$WORK/mnt/$vol" && pwd -P)
+            python3 testdata/generator/tool.py populate "$mp" "$profile"
+            sync
+            hdiutil detach -quiet "$DISK"; DISK=""
+            hdiutil convert -quiet "$WORK/$name.dmg" -format UDTO -o "$WORK/$name"
+            mv "$WORK/$name.cdr" "$OUT/$name.img"
+            rm -f "$WORK/$name.dmg"
+
+            out=$(hdiutil attach -readonly -nobrowse -owners on -mountroot "$WORK/ro" -imagekey diskimage-class=CRawDiskImage "$OUT/$name.img" 2>/dev/null)
+            DISK=$(awk '$2 == "GUID_partition_scheme" {print $1; exit}' <<<"$out")
+            [[ -n "$DISK" ]] || DISK=$(awk 'NR==1{print $1}' <<<"$out")
+            python3 testdata/generator/tool.py manifest "$WORK/ro/$vol" "$OUT/$name.$vol.manifest.json"
+            hdiutil detach -quiet "$DISK"; DISK=""
+          }
+
+          make_one basic 128m APFS Basic basic
+          make_one compressed 64m APFS Compressed compressed
+          make_one links 32m APFS Links links
+          make_one casesensitive 32m "Case-sensitive APFS" CaseSens casesensitive
+
+          ls -lh "$OUT"
+          tar -czf apfs-test-images.tar.gz -C "$OUT" .
+
+      - name: Upload generated APFS images
+        uses: actions/upload-artifact@v4
+        with:
+          name: apfs-test-images
+          path: apfs-test-images.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  winapfs-write:
+    runs-on: windows-2022
+    needs: generate-images
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download generated APFS images
+        uses: actions/download-artifact@v4
+        with:
+          name: apfs-test-images
+
+      - name: Extract test images into testdata
+        run: |
+          tar -xzf apfs-test-images.tar.gz -C testdata
+          if ($LASTEXITCODE -ne 0) { throw "Failed to extract apfs-test-images.tar.gz" }
+
+      - name: Install WinFsp SDK
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp-2.2.26323.msi'
+          Invoke-WebRequest -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.2/winfsp-2.2.26323.msi' -OutFile $msi
+          $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i', $msi, '/qn', 'ADDLOCAL=ALL'
+          if ($proc.ExitCode -notin 0, 3010) {
+            throw "WinFsp installation failed with exit code $($proc.ExitCode)"
+          }
+
+      - name: Build Release (x64)
+        run: |
+          cmd /c build.cmd Release
+          if ($LASTEXITCODE -ne 0) { throw "build.cmd Release failed ($LASTEXITCODE)" }
+
+      - name: Run apfsrw-writetest and winapfs-fsck
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          $cases = @(
+            @{ Img = 'basic.img'; Manifest = 'basic.Basic.manifest.json'; Vol = 'Basic'; Out = 'basic.written.img' },
+            @{ Img = 'compressed.img'; Manifest = 'compressed.Compressed.manifest.json'; Vol = 'Compressed'; Out = 'compressed.written.img' },
+            @{ Img = 'links.img'; Manifest = 'links.Links.manifest.json'; Vol = 'Links'; Out = 'links.written.img' },
+            @{ Img = 'casesensitive.img'; Manifest = 'casesensitive.CaseSens.manifest.json'; Vol = 'CaseSens'; Out = 'casesensitive.written.img' }
+          )
+          foreach ($c in $cases) {
+            $manifest = "testdata\$($c.Manifest)"
+            $src = "testdata\$($c.Img)"
+            $work = "out\$($c.Out)"
+            Write-Output "=== apfsrw-writetest: $($c.Img) ($($c.Vol)) ==="
+            & .\build\tests\Release\apfsrw-writetest.exe $manifest $src $work $c.Vol
+            if ($LASTEXITCODE -ne 0) { throw "apfsrw-writetest failed on $($c.Img) ($LASTEXITCODE)" }
+            Write-Output "=== winapfs-fsck -c: $work ==="
+            & .\build\src\fsck\Release\winapfs-fsck.exe -c $work
+            if ($LASTEXITCODE -ne 0) { throw "winapfs-fsck failed on $work ($LASTEXITCODE)" }
+          }
+          tar -czf apfs-written-images.tar.gz -C out .
+          if ($LASTEXITCODE -ne 0) { throw "Failed to pack apfs-written-images.tar.gz" }
+
+      - name: Upload winapfs-written APFS images
+        uses: actions/upload-artifact@v4
+        with:
+          name: apfs-written-images
+          path: apfs-written-images.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  macos-fsck:
+    runs-on: macos-latest
+    needs: winapfs-write
+    steps:
+      - name: Download winapfs-written APFS images
+        uses: actions/download-artifact@v4
+        with:
+          name: apfs-written-images
+
+      - name: Verify written images with Apple fsck_apfs and read-only mount
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d -t winapfs-fsck)"
+          DISK=""
+          cleanup() {
+            [[ -n "$DISK" ]] && hdiutil detach -force "$DISK" >/dev/null 2>&1 || true
+            rm -rf "$WORK"
+          }
+          trap cleanup EXIT
+          mkdir -p written
+          tar -xzf apfs-written-images.tar.gz -C written
+
+          for img in written/*.written.img; do
+            echo "========================================"
+            echo "Checking $img with Apple fsck_apfs -n -l"
+            echo "========================================"
+            out=$(hdiutil attach -nomount -readonly -imagekey diskimage-class=CRawDiskImage "$img")
+            echo "$out"
+            DISK=$(awk '$2 == "GUID_partition_scheme" {print $1; exit}' <<<"$out")
+            [[ -n "$DISK" ]] || DISK=$(awk 'NR==1{print $1}' <<<"$out")
+            CONT=$(awk 'toupper($2) ~ /^EF57347C-0000-11AA-AA11/ {print $1; exit}' <<<"$out")
+            [[ -n "$CONT" ]] || CONT=$(awk 'toupper($2) == "APPLE_APFS" {print $1; exit}' <<<"$out")
+            [[ -n "$CONT" ]] || { echo "ERROR: No APFS container found in $img"; exit 1; }
+            echo "Container device: $CONT (disk: $DISK)"
+            fsck_apfs -n -l "$CONT"
+            hdiutil detach -quiet "$DISK"; DISK=""
+
+            echo "Verifying macOS read-only mount of $img"
+            mnt="$WORK/mnt-$(basename "$img" .written.img)"
+            mkdir -p "$mnt"
+            out=$(hdiutil attach -nobrowse -readonly -mountroot "$mnt" -imagekey diskimage-class=CRawDiskImage "$img")
+            DISK=$(awk '$2 == "GUID_partition_scheme" {print $1; exit}' <<<"$out")
+            [[ -n "$DISK" ]] || DISK=$(awk 'NR==1{print $1}' <<<"$out")
+            vol_dir=$(find "$mnt" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+            [[ -n "$vol_dir" ]] || { echo "ERROR: Failed to mount $img on macOS"; exit 1; }
+            echo "Mounted $(basename "$vol_dir"):"
+            ls -la "$vol_dir"
+            hdiutil detach -quiet "$DISK"; DISK=""
+          done
+          echo "All winapfs-written APFS images passed Apple fsck_apfs and mounted cleanly on macOS."
