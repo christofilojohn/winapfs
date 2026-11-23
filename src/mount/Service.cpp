@@ -40,6 +40,8 @@
 #include <setupapi.h>
 #include <winioctl.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -325,13 +327,19 @@ public:
 			{
 				const VolStatus &s = kv.second;
 				std::string letter = "-", mode = "-";
+				uint64_t rbytes = 0, wbytes = 0;
 				for (const auto &m : d->mounts)
 					if (m.uuid == kv.first)
 					{
 						letter = WideToUtf8(m.fs->MountPoint());
 						mode = m.fs->Vol().Writable() ? "rw" : "ro";
+						rbytes = m.fs->ReadBytes();
+						wbytes = m.fs->WriteBytes();
 					}
-				out.push_back("vol\t" + kv.first + "\t" + Clean(s.name) + "\t" + s.state + "\t" + letter + "\t" + mode + "\t" + d->path + "\t" + Clean(s.note));
+				bool hide = m_cfg.Dword(VolKey(kv.first), L"HideDotfiles", m_cfg.Dword(L"", L"HideDotfiles", 1)) != 0;
+				out.push_back("vol\t" + kv.first + "\t" + Clean(s.name) + "\t" + s.state + "\t" + letter + "\t" + mode + "\t" +
+					d->path + "\t" + Clean(s.note) + "\t" + (hide ? "1" : "0") + "\t" +
+					std::to_string(rbytes) + "\t" + std::to_string(wbytes));
 			}
 		out.push_back("cfg\tAllowDiskWrites\t" + std::to_string(m_cfg.Dword(L"", L"AllowDiskWrites", 0)));
 		return out;
@@ -420,6 +428,40 @@ public:
 	std::string Set(const std::string &uuid, const std::string &key, const std::string &value)
 	{
 		std::wstring wkey = Utf8ToWide(key);
+		if (key == "DriveLetter")
+		{
+			if (value.size() != 2 || !std::isalpha(static_cast<unsigned char>(value[0])) || value[1] != ':')
+				return "the drive letter must be like X:";
+			wchar_t letter = static_cast<wchar_t>(std::toupper(static_cast<unsigned char>(value[0])));
+			if (letter < L'D' || letter > L'Z')
+				return "the drive letter must be between D: and Z:";
+			std::wstring wval({ letter, L':' });
+			bool remount = false;
+			{
+				std::lock_guard<std::mutex> lock(m_mutex);
+				Disk *d = nullptr;
+				VolStatus *s = Find(uuid, &d);
+				if (!s)
+					return "no such volume";
+				std::wstring cur_mp;
+				for (const auto &m : d->mounts)
+					if (m.uuid == uuid)
+						cur_mp = m.fs->MountPoint();
+				if (_wcsicmp(cur_mp.c_str(), wval.c_str()) != 0 && !LetterFree(letter))
+					return "drive letter is already in use";
+				if (!m_cfg.SetString(VolKey(uuid), L"DriveLetter", wval))
+					return "cannot store the setting";
+				if (!cur_mp.empty() && _wcsicmp(cur_mp.c_str(), wval.c_str()) != 0)
+				{
+					Stop(*d, uuid);
+					s->tried = false;
+					remount = true;
+				}
+			}
+			if (remount)
+				Scan();
+			return "";
+		}
 		if (key != "ReadWrite" && key != "Disabled" && key != "HideDotfiles")
 			return "unknown setting " + key;
 		if (value != "0" && value != "1")
@@ -461,6 +503,115 @@ public:
 		}
 		if (remount)
 			Scan();
+		return "";
+	}
+
+	std::string Verify(const std::string &uuid, std::string &out_lines)
+	{
+		out_lines.clear();
+		std::string path;
+		int part = -1;
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			Disk *d = nullptr;
+			VolStatus *s = Find(uuid, &d);
+			if (!s)
+				return "no such volume";
+			for (const auto &m : d->mounts)
+				if (m.fs->Vol().Writable())
+					m.fs->Vol().Sync();
+			path = d->path;
+			part = s->part;
+		}
+		if (path.empty() || path.find('"') != std::string::npos)
+			return "invalid disk path";
+
+		wchar_t exe_buf[MAX_PATH];
+		DWORD fn = GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
+		if (!fn || fn >= MAX_PATH)
+			return "cannot locate winapfs.exe";
+		std::wstring exe_dir(exe_buf, fn);
+		size_t slash = exe_dir.rfind(L'\\');
+		exe_dir = (slash == std::wstring::npos) ? L"" : exe_dir.substr(0, slash + 1);
+		std::wstring fsck_path = exe_dir + L"winapfs-fsck.exe";
+		if (GetFileAttributesW(fsck_path.c_str()) == INVALID_FILE_ATTRIBUTES)
+		{
+			std::wstring alt = exe_dir + L"..\\..\\fsck\\Release\\winapfs-fsck.exe";
+			if (GetFileAttributesW(alt.c_str()) != INVALID_FILE_ATTRIBUTES)
+				fsck_path = alt;
+			else
+				return "winapfs-fsck.exe not found";
+		}
+
+		SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+		HANDLE rd = nullptr, wr = nullptr;
+		if (!CreatePipe(&rd, &wr, &sa, 0))
+			return "cannot create output pipe";
+		SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+		std::wstring cmd = L"\"" + fsck_path + L"\" -c";
+		if (part >= 0)
+			cmd += L" --partition " + std::to_wstring(part);
+		cmd += L" \"" + Utf8ToWide(path) + L"\"";
+
+		STARTUPINFOW si = { sizeof(si) };
+		si.dwFlags = STARTF_USESTDHANDLES;
+		si.hStdInput = INVALID_HANDLE_VALUE;
+		si.hStdOutput = wr;
+		si.hStdError = wr;
+		PROCESS_INFORMATION pi = {};
+		BOOL ok = CreateProcessW(fsck_path.c_str(), &cmd[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+		CloseHandle(wr);
+		if (!ok)
+		{
+			DWORD e = GetLastError();
+			CloseHandle(rd);
+			return "cannot run winapfs-fsck.exe (error " + std::to_string(e) + ")";
+		}
+
+		std::string captured;
+		char buf[1024];
+		DWORD got = 0;
+		while (ReadFile(rd, buf, sizeof(buf), &got, nullptr) && got > 0)
+		{
+			if (captured.size() < 16384)
+			{
+				size_t take = (std::min)(static_cast<size_t>(got), 16384 - captured.size());
+				captured.append(buf, take);
+			}
+		}
+		CloseHandle(rd);
+
+		DWORD wait_rc = WaitForSingleObject(pi.hProcess, 60000);
+		DWORD exit_code = 1;
+		if (wait_rc != WAIT_OBJECT_0)
+		{
+			TerminateProcess(pi.hProcess, 1);
+			CloseHandle(pi.hThread);
+			CloseHandle(pi.hProcess);
+			return "winapfs-fsck timed out";
+		}
+		GetExitCodeProcess(pi.hProcess, &exit_code);
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+
+		out_lines = "exit\t" + std::to_string(exit_code) + "\n";
+		size_t pos = 0;
+		int kept = 0;
+		while (pos < captured.size() && kept < 40)
+		{
+			size_t nl = captured.find('\n', pos);
+			if (nl == std::string::npos)
+				nl = captured.size();
+			std::string line = captured.substr(pos, nl - pos);
+			pos = nl + 1;
+			while (!line.empty() && line.back() == '\r')
+				line.pop_back();
+			if (line.empty())
+				continue;
+			out_lines += Clean(std::move(line)) + "\n";
+			kept++;
+		}
 		return "";
 	}
 
@@ -907,6 +1058,8 @@ private:
 			err = m_mounter.Unmount(f[1]);
 		else if (cmd == "eject" && f.size() >= 2)
 			err = m_mounter.Eject(f[1]);
+		else if (cmd == "verify" && f.size() >= 2)
+			err = m_mounter.Verify(f[1], out);
 		else if (cmd == "set" && f.size() >= 4)
 			err = m_mounter.Set(f[1], f[2], f[3]);
 		else if (cmd == "rescan")
@@ -1351,7 +1504,9 @@ int CmdCtl(const std::vector<std::wstring> &args)
 			"       winapfs ctl mount <volume> [--password <pw>]\n"
 			"       winapfs ctl unmount <volume>\n"
 			"       winapfs ctl eject <volume>        unmount the disk's volumes and eject it\n"
+			"       winapfs ctl verify <volume>       check the APFS container (winapfs-fsck -c)\n"
 			"       winapfs ctl set <volume> <ReadWrite|Disabled|HideDotfiles> <0|1>\n"
+			"       winapfs ctl set <volume> DriveLetter <X:>\n"
 			"       winapfs ctl rescan\n"
 			"<volume>: a name or UUID from `winapfs ctl list`. Talks to the service\n"
 			"(WINAPFS_PIPE selects another pipe, e.g. service debug's).\n");
@@ -1410,7 +1565,7 @@ int CmdCtl(const std::vector<std::wstring> &args)
 		if (args.size() >= 4 && args[2] == L"--password")
 			req += "\t" + WideToUtf8(args[3]);
 	}
-	else if (cmd == "unmount" || cmd == "eject")
+	else if (cmd == "unmount" || cmd == "eject" || cmd == "verify")
 		req = cmd + "\t" + uuid;
 	else if (cmd == "set" && args.size() >= 4)
 		req = "set\t" + uuid + "\t" + WideToUtf8(args[2]) + "\t" + WideToUtf8(args[3]);
@@ -1422,6 +1577,20 @@ int CmdCtl(const std::vector<std::wstring> &args)
 	{
 		fprintf(stderr, "%s\n", err.c_str());
 		return 1;
+	}
+	if (cmd == "verify")
+	{
+		int fsck_code = 0;
+		for (const auto &l : lines)
+		{
+			if (l.compare(0, 5, "exit\t") == 0)
+				fsck_code = std::atoi(l.c_str() + 5);
+			else
+				printf("%s\n", l.c_str());
+		}
+		if (fsck_code == 0)
+			printf("ok\n");
+		return fsck_code ? 1 : 0;
 	}
 	printf("ok\n");
 	return 0;

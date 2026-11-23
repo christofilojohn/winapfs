@@ -19,6 +19,9 @@ struct VolumeCardData : VolumeStatus
 	bool has_space = false;
 	uint64_t total_bytes = 0;
 	uint64_t free_bytes = 0;
+	uint64_t read_bps = 0;
+	uint64_t write_bps = 0;
+	bool verifying = false;
 };
 
 struct DashboardState
@@ -43,6 +46,9 @@ struct DashboardCallbacks
 	std::function<void(const VolumeStatus &)> on_eject;
 	std::function<void(const VolumeStatus &)> on_toggle_rw;
 	std::function<void(const VolumeStatus &)> on_toggle_auto;
+	std::function<void(const VolumeStatus &)> on_toggle_dotfiles;
+	std::function<void(const VolumeStatus &)> on_change_letter;
+	std::function<void(const VolumeStatus &)> on_verify;
 	std::function<void(bool current_allow)> on_toggle_allow_writes;
 	std::function<void()> on_rescan;
 	std::function<void()> on_start_service;

@@ -11,6 +11,7 @@
 
 #include <winfsp/winfsp.h>
 
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -76,6 +77,11 @@ public:
 	const MountOptions &Options() const { return m_opts; }
 	FSP_FILE_SYSTEM *FileSystem() { return m_fs; }
 
+	void AddReadBytes(uint64_t n) { m_read_bytes.fetch_add(n, std::memory_order_relaxed); }
+	void AddWriteBytes(uint64_t n) { m_write_bytes.fetch_add(n, std::memory_order_relaxed); }
+	uint64_t ReadBytes() const { return m_read_bytes.load(std::memory_order_relaxed); }
+	uint64_t WriteBytes() const { return m_write_bytes.load(std::memory_order_relaxed); }
+
 private:
 	bool FollowLink(uint64_t dir, const std::string &target, int depth, Stat &out);
 	std::string LocalTarget(const std::string &target);
@@ -97,6 +103,8 @@ private:
 
 	std::mutex m_pending_mutex;
 	std::unordered_map<uint64_t, uint64_t> m_pending_size;   // inode -> size Windows set
+	std::atomic<uint64_t> m_read_bytes{ 0 };
+	std::atomic<uint64_t> m_write_bytes{ 0 };
 };
 
 // Loads winfsp-x64.dll from the WinFsp install directory (delay-loaded).

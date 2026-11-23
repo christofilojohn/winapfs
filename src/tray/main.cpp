@@ -24,10 +24,14 @@
 #include <gdiplus.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <wincred.h>
 
 #include <atomic>
+#include <cctype>
+#include <cstdlib>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -42,9 +46,11 @@ constexpr UINT WM_ACTION_DONE = WM_APP + 2;          // lParam: new std::wstring
 constexpr UINT WM_POLL_DONE = WM_APP + 3;            // lParam: new PollUiUpdate
 constexpr UINT WM_UPDATE_RESULT = WM_APP + 4;        // lParam: new UpdateResultMsg
 constexpr UINT WM_UPDATE_DOWNLOAD_DONE = WM_APP + 5; // lParam: new UpdateDownloadMsg
+constexpr UINT WM_VERIFY_DONE = WM_APP + 6;          // lParam: new VerifyResultMsg
+constexpr UINT WM_EJECT_DONE = WM_APP + 7;           // lParam: new EjectDoneMsg
 constexpr UINT_PTR TIMER_POLL = 1;
 constexpr UINT_PTR TIMER_STARTUP_UPDATE = 2;
-constexpr UINT kPollMs = 2500;
+constexpr UINT kPollMs = 1500;
 
 enum MenuId : UINT
 {
@@ -56,7 +62,7 @@ enum MenuId : UINT
 	ID_CHECK_UPDATES,
 	ID_ABOUT,
 	ID_EXIT,
-	ID_VOLUME_BASE = 1000,   // + 10 * volume index + action
+	ID_VOLUME_BASE = 1000,   // + 20 * volume index + action
 };
 
 enum VolumeAction : UINT
@@ -68,6 +74,17 @@ enum VolumeAction : UINT
 	VA_EJECT,
 	VA_READWRITE,
 	VA_AUTOMOUNT,
+	VA_DOTFILES,
+	VA_LETTER,
+	VA_VERIFY,
+	VA_FORGET_PW,
+};
+
+struct IoSample
+{
+	uint64_t read_bytes = 0;
+	uint64_t write_bytes = 0;
+	ULONGLONG tick_ms = 0;
 };
 
 HINSTANCE g_inst;
@@ -83,6 +100,9 @@ bool g_allow_writes = false;
 bool g_service_up = false;
 bool g_service_installed = false;
 std::map<std::string, std::string> g_seen;   // uuid -> "state|letter|mode" at the last poll
+std::map<std::string, IoSample> g_io_samples;
+std::set<std::string> g_verifying;
+std::set<std::string> g_auto_unlock_tried;
 bool g_first_poll = true;
 std::string g_balloon_uuid;            // a locked volume the last notification was about
 std::atomic<bool> g_polling{ false };
@@ -116,8 +136,30 @@ struct UpdateDownloadMsg
 	std::string err;
 };
 
+struct VerifyResultMsg
+{
+	std::string uuid;
+	std::wstring name;
+	int rc = 0;
+	int exit_code = 0;
+	std::string output;
+	std::string err;
+};
+
+struct EjectDoneMsg
+{
+	bool ok = false;
+	std::wstring name;
+	std::string err;
+};
+
 void SyncDashboardState(DashboardState s)
 {
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		for (auto &card : s.vols)
+			card.verifying = g_verifying.count(card.uuid) != 0;
+	}
 	s.update_checking = g_checking_update.load();
 	s.update_downloading = g_downloading_update.load();
 	s.update_available = g_update.ok && g_update.update_available;
@@ -151,6 +193,87 @@ std::string U(const std::wstring &w)
 	std::string s(n, '\0');
 	WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), &s[0], n, nullptr, nullptr);
 	return s;
+}
+
+void SecureClearString(std::string &s)
+{
+	if (!s.empty())
+	{
+		SecureZeroMemory(&s[0], s.size());
+		s.clear();
+	}
+}
+
+void SecureClearWString(std::wstring &w)
+{
+	if (!w.empty())
+	{
+		SecureZeroMemory(&w[0], w.size() * sizeof(wchar_t));
+		w.clear();
+	}
+}
+
+std::wstring CredTarget(const std::string &uuid)
+{
+	return L"winapfs:volume:" + W(uuid);
+}
+
+bool HasSavedPassword(const std::string &uuid)
+{
+	if (uuid.empty())
+		return false;
+	PCREDENTIALW cred = nullptr;
+	if (!CredReadW(CredTarget(uuid).c_str(), CRED_TYPE_GENERIC, 0, &cred))
+		return false;
+	CredFree(cred);
+	return true;
+}
+
+bool SaveVolumePassword(const std::string &uuid, const std::string &vol_name, const std::wstring &pw)
+{
+	if (uuid.empty() || pw.empty() || pw.size() * sizeof(wchar_t) > CRED_MAX_CREDENTIAL_BLOB_SIZE)
+		return false;
+	std::wstring target = CredTarget(uuid);
+	std::wstring user = L"APFS: " + W(vol_name.empty() ? uuid : vol_name);
+	CREDENTIALW c = {};
+	c.Type = CRED_TYPE_GENERIC;
+	c.TargetName = &target[0];
+	c.CredentialBlobSize = static_cast<DWORD>(pw.size() * sizeof(wchar_t));
+	c.CredentialBlob = reinterpret_cast<LPBYTE>(const_cast<wchar_t *>(pw.data()));
+	c.Persist = CRED_PERSIST_LOCAL_MACHINE;
+	c.UserName = &user[0];
+	return CredWriteW(&c, 0) != FALSE;
+}
+
+bool LoadVolumePassword(const std::string &uuid, std::string &out_utf8_pw)
+{
+	out_utf8_pw.clear();
+	if (uuid.empty())
+		return false;
+	PCREDENTIALW cred = nullptr;
+	if (!CredReadW(CredTarget(uuid).c_str(), CRED_TYPE_GENERIC, 0, &cred))
+		return false;
+	bool ok = false;
+	if (cred->CredentialBlob && cred->CredentialBlobSize >= sizeof(wchar_t) &&
+		(cred->CredentialBlobSize % sizeof(wchar_t)) == 0)
+	{
+		std::wstring wpw(reinterpret_cast<const wchar_t *>(cred->CredentialBlob),
+			cred->CredentialBlobSize / sizeof(wchar_t));
+		out_utf8_pw = U(wpw);
+		SecureClearWString(wpw);
+		ok = !out_utf8_pw.empty();
+	}
+	if (cred->CredentialBlob && cred->CredentialBlobSize)
+		SecureZeroMemory(cred->CredentialBlob, cred->CredentialBlobSize);
+	CredFree(cred);
+	return ok;
+}
+
+bool DeleteVolumePassword(const std::string &uuid)
+{
+	if (uuid.empty())
+		return false;
+	return CredDeleteW(CredTarget(uuid).c_str(), CRED_TYPE_GENERIC, 0) != FALSE;
 }
 
 std::wstring WinapfsExe()
@@ -209,12 +332,62 @@ void StartPollAsync()
 		bool allow = false;
 		std::string err;
 		bool up = ControlList(g_pipe, vols, allow, err);
+		ULONGLONG now_ms = GetTickCount64();
 		bool installed = up ? true : ServiceInstalled();
 
 		std::vector<std::pair<std::wstring, std::wstring>> notes;   // title, text
 		std::string locked_uuid;
+		std::map<std::string, std::pair<uint64_t, uint64_t>> speeds;
+		std::set<std::string> verifying_copy;
+		std::vector<VolumeStatus> auto_unlock_candidates;
 		{
 			std::lock_guard<std::mutex> lock(g_mutex);
+			verifying_copy = g_verifying;
+			if (up)
+			{
+				for (auto it = g_auto_unlock_tried.begin(); it != g_auto_unlock_tried.end();)
+				{
+					bool still = false;
+					for (const auto &v : vols)
+						if (v.uuid == *it)
+						{
+							still = true;
+							break;
+						}
+					it = still ? std::next(it) : g_auto_unlock_tried.erase(it);
+				}
+				std::map<std::string, IoSample> next_samples;
+				for (const auto &v : vols)
+				{
+					if (v.state == "mounted")
+					{
+						uint64_t r_bps = 0, w_bps = 0;
+						auto sit = g_io_samples.find(v.uuid);
+						if (sit != g_io_samples.end() && now_ms > sit->second.tick_ms)
+						{
+							ULONGLONG dt = now_ms - sit->second.tick_ms;
+							if (v.read_bytes >= sit->second.read_bytes)
+								r_bps = ((v.read_bytes - sit->second.read_bytes) * 1000ULL) / dt;
+							if (v.write_bytes >= sit->second.write_bytes)
+								w_bps = ((v.write_bytes - sit->second.write_bytes) * 1000ULL) / dt;
+						}
+						speeds[v.uuid] = { r_bps, w_bps };
+						next_samples[v.uuid] = { v.read_bytes, v.write_bytes, now_ms };
+					}
+					else if (v.state == "locked" && g_auto_unlock_tried.find(v.uuid) == g_auto_unlock_tried.end())
+					{
+						g_auto_unlock_tried.insert(v.uuid);
+						auto_unlock_candidates.push_back(v);
+					}
+				}
+				g_io_samples = std::move(next_samples);
+			}
+			else
+			{
+				g_io_samples.clear();
+				g_auto_unlock_tried.clear();
+			}
+
 			if (!g_first_poll && up)
 				for (const auto &v : vols)
 				{
@@ -227,8 +400,11 @@ void StartPollAsync()
 						notes.emplace_back(W(v.name) + L" is ready", L"Mounted at " + W(v.letter) + L" (" + StateText(v) + L")");
 					else if (v.state == "locked" && before.compare(0, 6, "locked") != 0)
 					{
-						notes.emplace_back(W(v.name) + L" is encrypted", L"Click here to unlock it with its password.");
-						locked_uuid = v.uuid;
+						if (!HasSavedPassword(v.uuid))
+						{
+							notes.emplace_back(W(v.name) + L" is encrypted", L"Click here to unlock it with its password.");
+							locked_uuid = v.uuid;
+						}
 					}
 					else if (before.compare(0, 7, "mounted") == 0)
 						notes.emplace_back(W(v.name) + L" unmounted", v.note.empty() ? L"It is no longer mounted." : W(v.note));
@@ -265,6 +441,13 @@ void StartPollAsync()
 		{
 			VolumeCardData card;
 			static_cast<VolumeStatus &>(card) = v;
+			auto sp_it = speeds.find(v.uuid);
+			if (sp_it != speeds.end())
+			{
+				card.read_bps = sp_it->second.first;
+				card.write_bps = sp_it->second.second;
+			}
+			card.verifying = verifying_copy.count(v.uuid) != 0;
 			if (v.state == "mounted" && v.letter.size() >= 2 && v.letter[1] == ':')
 			{
 				std::wstring root = W(v.letter) + L"\\";
@@ -294,6 +477,29 @@ void StartPollAsync()
 		g_polling.store(false);
 		if (g_exiting.load() || !PostMessageW(g_wnd, WM_POLL_DONE, 0, reinterpret_cast<LPARAM>(upd)))
 			delete upd;
+
+		if (up && !auto_unlock_candidates.empty())
+		{
+			std::thread([cands = std::move(auto_unlock_candidates)] {
+				for (const auto &v : cands)
+				{
+					if (g_exiting.load())
+						break;
+					std::string pw;
+					if (!LoadVolumePassword(v.uuid, pw))
+						continue;
+					std::string req = "mount\t" + v.uuid + "\t" + pw;
+					SecureClearString(pw);
+					std::vector<std::string> lines;
+					std::string perr;
+					int rc = ControlRequest(g_pipe, req, lines, perr);
+					SecureClearString(req);
+					std::wstring *msg = rc ? new std::wstring(L"Saved password failed for " + W(v.name) + L": " + W(perr)) : nullptr;
+					if (g_exiting.load() || !PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
+						delete msg;
+				}
+			}).detach();
+		}
 	}).detach();
 }
 
@@ -353,6 +559,8 @@ struct UnlockData
 {
 	std::wstring name;
 	std::wstring password;
+	bool has_saved = false;
+	bool remember = false;
 };
 
 INT_PTR CALLBACK UnlockProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
@@ -365,6 +573,8 @@ INT_PTR CALLBACK UnlockProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
 		SetWindowLongPtrW(dlg, DWLP_USER, lp);
 		SetDlgItemTextW(dlg, IDC_UNLOCK_TEXT, (L"\"" + d->name + L"\" is encrypted. Enter its password or recovery key:").c_str());
 		SetDlgItemTextW(dlg, IDC_HINT, L"The password is sent to the winapfs service on this PC only.");
+		if (d->has_saved)
+			CheckDlgButton(dlg, IDC_REMEMBER, BST_CHECKED);
 		static HICON small_icon = nullptr, big_icon = nullptr;   // loaded once, kept
 		if (!small_icon)
 		{
@@ -387,6 +597,7 @@ INT_PTR CALLBACK UnlockProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
 				GetDlgItemTextW(dlg, IDC_PASSWORD, buf, 512);
 				d->password = buf;
 				SecureZeroMemory(buf, sizeof(buf));
+				d->remember = IsDlgButtonChecked(dlg, IDC_REMEMBER) == BST_CHECKED;
 			}
 			EndDialog(dlg, LOWORD(wp));
 			return TRUE;
@@ -400,18 +611,38 @@ void ActionUnlock(VolumeStatus v)
 {
 	UnlockData d;
 	d.name = W(v.name);
+	d.has_saved = HasSavedPassword(v.uuid);
 	if (DialogBoxParamW(g_inst, MAKEINTRESOURCEW(IDD_UNLOCK), DialogOwner(), UnlockProc, reinterpret_cast<LPARAM>(&d)) != IDOK || d.password.empty())
-		return;
-	std::string pw = U(d.password);
-	SecureZeroMemory(&d.password[0], d.password.size() * sizeof(wchar_t));
-	d.password.clear();
-	std::string req = "mount\t" + v.uuid + "\t" + pw;
-	if (!pw.empty())
 	{
-		SecureZeroMemory(&pw[0], pw.size());
-		pw.clear();
+		SecureClearWString(d.password);
+		return;
 	}
-	Request(std::move(req), L"Cannot unlock " + d.name);
+	std::wstring wpw_copy = d.remember ? d.password : L"";
+	std::string pw = U(d.password);
+	SecureClearWString(d.password);
+	std::string req = "mount\t" + v.uuid + "\t" + pw;
+	SecureClearString(pw);
+	bool remember = d.remember;
+	std::wstring vname = d.name;
+	std::thread([req = std::move(req), v, remember, wpw = std::move(wpw_copy), vname]() mutable {
+		std::vector<std::string> lines;
+		std::string err;
+		int rc = ControlRequest(g_pipe, req, lines, err);
+		SecureClearString(req);
+		if (rc == 0 && remember && !wpw.empty())
+		{
+			if (!SaveVolumePassword(v.uuid, v.name, wpw))
+				err = "unlocked, but could not save password in Windows Credential Manager";
+		}
+		SecureClearWString(wpw);
+		std::wstring *msg = nullptr;
+		if (rc)
+			msg = new std::wstring(L"Cannot unlock " + vname + L": " + W(err));
+		else if (!err.empty())
+			msg = new std::wstring(W(err));
+		if (!PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
+			delete msg;
+	}).detach();
 }
 
 void ActionOpen(const VolumeStatus &v)
@@ -431,8 +662,20 @@ void ActionUnmount(const VolumeStatus &v)
 
 void ActionEject(const VolumeStatus &v)
 {
-	Request("eject\t" + v.uuid, L"Cannot eject " + W(v.name));
-	Notify(L"Ejecting the disk", L"Wait for the next message before unplugging it.");
+	std::string uuid = v.uuid;
+	std::wstring name = W(v.name);
+	Notify(L"Safely ejecting disk", L"Flushing APFS cache and unmounting volumes\x2026");
+	std::thread([uuid, name] {
+		std::vector<std::string> lines;
+		std::string err;
+		int rc = ControlRequest(g_pipe, "eject\t" + uuid, lines, err);
+		auto *res = new EjectDoneMsg;
+		res->ok = (rc == 0);
+		res->name = name;
+		res->err = err;
+		if (g_exiting.load() || !PostMessageW(g_wnd, WM_EJECT_DONE, 0, reinterpret_cast<LPARAM>(res)))
+			delete res;
+	}).detach();
 }
 
 void ActionToggleReadWrite(VolumeStatus v)
@@ -448,6 +691,96 @@ void ActionToggleReadWrite(VolumeStatus v)
 void ActionToggleAutoMount(const VolumeStatus &v)
 {
 	Request("set\t" + v.uuid + "\tDisabled\t" + (v.state == "disabled" ? "0" : "1"), L"Cannot change " + W(v.name));
+}
+
+void ActionToggleDotfiles(const VolumeStatus &v)
+{
+	Request("set\t" + v.uuid + "\tHideDotfiles\t" + (v.hide_dotfiles ? "0" : "1"), L"Cannot change " + W(v.name));
+}
+
+void ActionChangeLetter(const VolumeStatus &v)
+{
+	HMENU m = CreatePopupMenu();
+	wchar_t cur = (v.letter.size() >= 2 && std::isalpha(static_cast<unsigned char>(v.letter[0])) && v.letter[1] == ':')
+		? static_cast<wchar_t>(towupper(v.letter[0])) : 0;
+	DWORD used = GetLogicalDrives();
+	int count = 0;
+	for (wchar_t c = L'D'; c <= L'Z'; c++)
+	{
+		wchar_t root[] = { c, L':', 0 };
+		wchar_t target[MAX_PATH];
+		bool is_cur = (c == cur);
+		bool is_free = !(used & (1u << (c - L'A'))) && !QueryDosDeviceW(root, target, MAX_PATH);
+		if (!is_free && !is_cur)
+			continue;
+		std::wstring label = is_cur ? (std::wstring(root) + L" (current)") : std::wstring(root);
+		AppendMenuW(m, MF_STRING | (is_cur ? MF_CHECKED : 0), static_cast<UINT>(c - L'D' + 1), label.c_str());
+		count++;
+	}
+	if (count == 0)
+		AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"No free drive letters");
+	POINT pt;
+	GetCursorPos(&pt);
+	HWND owner = DialogOwner();
+	SetForegroundWindow(owner);
+	UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, owner, nullptr);
+	PostMessageW(owner, WM_NULL, 0, 0);
+	DestroyMenu(m);
+	if (cmd >= 1 && cmd <= ('Z' - 'D' + 1))
+	{
+		wchar_t chosen = static_cast<wchar_t>(L'D' + cmd - 1);
+		if (chosen != cur)
+		{
+			std::string ltr(1, static_cast<char>('D' + cmd - 1));
+			ltr += ':';
+			Request("set\t" + v.uuid + "\tDriveLetter\t" + ltr, L"Cannot change drive letter of " + W(v.name));
+		}
+	}
+}
+
+void ActionVerify(const VolumeStatus &v)
+{
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		if (!g_verifying.insert(v.uuid).second)
+			return;
+	}
+	SyncDashboardState(g_last_dash);
+	std::string uuid = v.uuid;
+	std::wstring name = W(v.name);
+	std::thread([uuid, name] {
+		std::vector<std::string> lines;
+		std::string err;
+		int rc = ControlRequest(g_pipe, "verify\t" + uuid, lines, err);
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			g_verifying.erase(uuid);
+		}
+		auto *res = new VerifyResultMsg;
+		res->uuid = uuid;
+		res->name = name;
+		res->rc = rc;
+		res->err = err;
+		for (const auto &l : lines)
+		{
+			if (l.compare(0, 5, "exit\t") == 0)
+				res->exit_code = std::atoi(l.c_str() + 5);
+			else
+			{
+				if (!res->output.empty())
+					res->output += "\n";
+				res->output += l;
+			}
+		}
+		if (g_exiting.load() || !PostMessageW(g_wnd, WM_VERIFY_DONE, 0, reinterpret_cast<LPARAM>(res)))
+			delete res;
+	}).detach();
+}
+
+void ActionForgetPassword(const VolumeStatus &v)
+{
+	if (DeleteVolumePassword(v.uuid))
+		Notify(L"winapfs", L"Removed saved password for \"" + W(v.name) + L"\" from Credential Manager.");
 }
 
 void ActionToggleAllowWrites(bool allow)
@@ -581,16 +914,17 @@ void ShowMenu()
 	for (size_t i = 0; i < vols.size() && i < 90; i++)
 	{
 		const VolumeStatus &v = vols[i];
-		UINT base = ID_VOLUME_BASE + static_cast<UINT>(i) * 10;
+		UINT base = ID_VOLUME_BASE + static_cast<UINT>(i) * 20;
 		HMENU sub = CreatePopupMenu();
 		bool mounted = v.state == "mounted";
+		bool locked = v.state == "locked";
 		if (mounted)
 		{
 			AppendMenuW(sub, MF_STRING, base + VA_OPEN, (L"Open " + W(v.letter)).c_str());
 			SetMenuDefaultItem(sub, base + VA_OPEN, FALSE);
 			AppendMenuW(sub, MF_STRING, base + VA_UNMOUNT, L"Unmount");
 		}
-		else if (v.state == "locked")
+		else if (locked)
 			AppendMenuW(sub, MF_STRING, base + VA_UNLOCK, L"Unlock\x2026");
 		else
 			AppendMenuW(sub, MF_STRING, base + VA_MOUNT, L"Mount");
@@ -598,9 +932,15 @@ void ShowMenu()
 			AppendMenuW(sub, MF_STRING, base + VA_EJECT, L"Eject disk (safely remove)");
 		AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
 		bool rw_possible = !IsPhysical(v) || allow;
-		AppendMenuW(sub, MF_STRING | (v.mode == "rw" ? MF_CHECKED : 0) | (rw_possible && v.state != "locked" ? 0 : MF_GRAYED), base + VA_READWRITE,
+		AppendMenuW(sub, MF_STRING | (v.mode == "rw" ? MF_CHECKED : 0) | (rw_possible && !locked ? 0 : MF_GRAYED), base + VA_READWRITE,
 			rw_possible ? L"Read-write" : L"Read-write (allow writing to disks first)");
-		AppendMenuW(sub, MF_STRING | (v.state != "disabled" ? MF_CHECKED : 0), base + VA_AUTOMOUNT, L"Mount automatically");
+		AppendMenuW(sub, MF_STRING | (v.state != "disabled" ? MF_CHECKED : 0) | (locked ? MF_GRAYED : 0), base + VA_AUTOMOUNT, L"Mount automatically");
+		AppendMenuW(sub, MF_STRING | (v.hide_dotfiles ? MF_CHECKED : 0) | (locked ? MF_GRAYED : 0), base + VA_DOTFILES, L"Hide macOS dotfiles (._*, .DS_Store)");
+		AppendMenuW(sub, MF_STRING | (locked ? MF_GRAYED : 0), base + VA_LETTER, L"Change drive letter\x2026");
+		AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+		AppendMenuW(sub, MF_STRING, base + VA_VERIFY, L"Verify disk (fsck)\x2026");
+		if (HasSavedPassword(v.uuid))
+			AppendMenuW(sub, MF_STRING, base + VA_FORGET_PW, L"Forget saved password");
 		if (!v.note.empty())
 		{
 			AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
@@ -635,8 +975,8 @@ void ShowMenu()
 
 	if (cmd >= ID_VOLUME_BASE)
 	{
-		size_t i = (cmd - ID_VOLUME_BASE) / 10;
-		UINT action = (cmd - ID_VOLUME_BASE) % 10;
+		size_t i = (cmd - ID_VOLUME_BASE) / 20;
+		UINT action = (cmd - ID_VOLUME_BASE) % 20;
 		if (i >= vols.size())
 			return;
 		const VolumeStatus &v = vols[i];
@@ -649,6 +989,10 @@ void ShowMenu()
 		case VA_EJECT: ActionEject(v); break;
 		case VA_READWRITE: ActionToggleReadWrite(v); break;
 		case VA_AUTOMOUNT: ActionToggleAutoMount(v); break;
+		case VA_DOTFILES: ActionToggleDotfiles(v); break;
+		case VA_LETTER: ActionChangeLetter(v); break;
+		case VA_VERIFY: ActionVerify(v); break;
+		case VA_FORGET_PW: ActionForgetPassword(v); break;
 		}
 		return;
 	}
@@ -836,6 +1180,50 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 		StartPollAsync();
 		return 0;
 	}
+	case WM_EJECT_DONE:
+	{
+		auto *res = reinterpret_cast<EjectDoneMsg *>(lp);
+		if (res)
+		{
+			if (res->ok)
+				Notify(L"Safe to remove hardware", L"\"" + res->name + L"\" flushed and ejected cleanly. You can unplug the drive now.");
+			else
+				Notify(L"Cannot eject " + res->name, W(res->err), NIIF_WARNING);
+			delete res;
+		}
+		StartPollAsync();
+		return 0;
+	}
+	case WM_VERIFY_DONE:
+	{
+		auto *res = reinterpret_cast<VerifyResultMsg *>(lp);
+		if (res)
+		{
+			SyncDashboardState(g_last_dash);
+			StartPollAsync();
+			if (res->rc != 0)
+			{
+				MessageBoxW(DialogOwner(), (L"Could not verify \"" + res->name + L"\":\n\n" + W(res->err)).c_str(),
+					L"Verify APFS Disk", MB_OK | MB_ICONWARNING);
+			}
+			else if (res->exit_code == 0)
+			{
+				std::wstring msg = L"\"" + res->name + L"\" passed winapfs-fsck integrity verification (exit code 0).";
+				if (!res->output.empty())
+					msg += L"\n\nDetails:\n" + W(res->output);
+				MessageBoxW(DialogOwner(), msg.c_str(), L"Verify APFS Disk", MB_OK | MB_ICONINFORMATION);
+			}
+			else
+			{
+				std::wstring msg = L"winapfs-fsck reported issues on \"" + res->name + L"\" (exit code " + std::to_wstring(res->exit_code) + L").";
+				if (!res->output.empty())
+					msg += L"\n\nDetails:\n" + W(res->output);
+				MessageBoxW(DialogOwner(), msg.c_str(), L"Verify APFS Disk", MB_OK | MB_ICONWARNING);
+			}
+			delete res;
+		}
+		return 0;
+	}
 	case WM_DESTROY:
 		g_exiting.store(true);
 		DashboardDestroy();
@@ -910,6 +1298,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 	dash_cbs.on_eject = ActionEject;
 	dash_cbs.on_toggle_rw = ActionToggleReadWrite;
 	dash_cbs.on_toggle_auto = ActionToggleAutoMount;
+	dash_cbs.on_toggle_dotfiles = ActionToggleDotfiles;
+	dash_cbs.on_change_letter = ActionChangeLetter;
+	dash_cbs.on_verify = ActionVerify;
 	dash_cbs.on_toggle_allow_writes = ActionToggleAllowWrites;
 	dash_cbs.on_rescan = ActionRescan;
 	dash_cbs.on_start_service = ActionStartService;

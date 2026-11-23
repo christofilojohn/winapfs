@@ -40,6 +40,9 @@ enum class BtnKind
 	VolEject,
 	VolToggleRw,
 	VolToggleAuto,
+	VolToggleDotfiles,
+	VolChangeLetter,
+	VolVerify,
 };
 
 enum class BtnTone
@@ -141,6 +144,11 @@ std::wstring FormatBytes(uint64_t bytes)
 	else
 		_snwprintf_s(buf, _TRUNCATE, val >= 100.0 ? L"%.0f %s" : L"%.1f %s", val, kUnits[idx]);
 	return buf;
+}
+
+std::wstring FormatSpeed(uint64_t bps)
+{
+	return FormatBytes(bps) + L"/s";
 }
 
 bool IsSystemDarkMode()
@@ -526,7 +534,7 @@ void PaintWindow(HWND hwnd)
 				bool locked = v.state == "locked";
 				bool rw = v.mode == "rw";
 				bool has_note = !v.note.empty();
-				float card_h = 116.0f * s + (v.has_space ? 26.0f * s : 0.0f) + (has_note ? 20.0f * s : 0.0f);
+				float card_h = 148.0f * s + (v.has_space ? 26.0f * s : 0.0f) + (has_note ? 20.0f * s : 0.0f);
 
 				Gdiplus::RectF card(pad_x, y, card_w, card_h);
 				g_card_rects.push_back(card);
@@ -601,8 +609,19 @@ void PaintWindow(HWND hwnd)
 						pill_fg = pal.red_pill_fg;
 					}
 
+					std::wstring speed_txt;
+					if (mounted && (v.read_bps > 0 || v.write_bps > 0))
+					{
+						if (v.read_bps > 0 && v.write_bps > 0)
+							speed_txt = L"\x2193 " + FormatSpeed(v.read_bps) + L"  \x2191 " + FormatSpeed(v.write_bps);
+						else if (v.read_bps > 0)
+							speed_txt = L"\x2193 " + FormatSpeed(v.read_bps);
+						else
+							speed_txt = L"\x2191 " + FormatSpeed(v.write_bps);
+					}
 					float pill_w = MeasureTextWidth(g, pill_txt, f_pill) + 18.0f * s;
-					float name_max_w = (std::max)(80.0f * s, right_edge - text_x - pill_w - 10.0f * s);
+					float speed_w = speed_txt.empty() ? 0.0f : (MeasureTextWidth(g, speed_txt, f_pill) + 18.0f * s + 6.0f * s);
+					float name_max_w = (std::max)(80.0f * s, right_edge - text_x - pill_w - speed_w - 10.0f * s);
 					float name_w = (std::min)(name_max_w, MeasureTextWidth(g, vname, f_card_title) + 4.0f * s);
 
 					Gdiplus::SolidBrush name_br(pal.text_primary);
@@ -613,6 +632,13 @@ void PaintWindow(HWND hwnd)
 
 					float after_pill = 0.0f;
 					DrawPill(g, text_x + name_w + 8.0f * s, card.Y + 16.0f * s, 20.0f * s, pill_txt, pill_bg, pill_fg, f_pill, 9.0f * s, after_pill);
+					if (!speed_txt.empty())
+					{
+						float unused = 0.0f;
+						DrawPill(g, after_pill + 6.0f * s, card.Y + 16.0f * s, 20.0f * s, speed_txt,
+							v.write_bps > 0 ? pal.amber_pill_bg : pal.blue_pill_bg,
+							v.write_bps > 0 ? pal.amber_pill_fg : pal.blue_pill_fg, f_pill, 8.0f * s, unused);
+					}
 
 					// Disk source + type
 					std::wstring meta = (IsPhysicalDisk(v) ? L"Physical Disk  \x2022  " : L"Disk Image  \x2022  ") + ToWide(v.disk);
@@ -654,46 +680,57 @@ void PaintWindow(HWND hwnd)
 						cur_y += 26.0f * s;
 					}
 
-					// Action buttons row
+					// Action buttons row 1 (primary actions)
 					float bx = text_x;
-					float by = card.GetBottom() - 40.0f * s;
+					float by = card.GetBottom() - 70.0f * s;
 					float bh = 28.0f * s;
-					float bgap = 8.0f * s;
-					auto add_btn = [&](BtnKind kind, const std::wstring &label, BtnTone tone, bool enabled) {
-						float bw = MeasureTextWidth(g, label, f_btn) + 22.0f * s;
+					float bgap = 7.0f * s;
+					auto add_btn = [&](BtnKind kind, const std::wstring &label, BtnTone tone, bool enabled, const Gdiplus::Font &font, float pad, float row_h) {
+						float bw = MeasureTextWidth(g, label, font) + pad * s;
 						HitButton hb;
-						hb.rect = Gdiplus::RectF(bx, by, bw, bh);
+						hb.rect = Gdiplus::RectF(bx, by, bw, row_h);
 						hb.kind = kind;
 						hb.vol_index = static_cast<int>(i);
 						hb.tone = tone;
 						hb.text = label;
 						hb.enabled = enabled;
 						g_buttons.push_back(hb);
-						DrawButton(g, hb, static_cast<int>(g_buttons.size()) - 1, s, pal, f_btn);
+						DrawButton(g, hb, static_cast<int>(g_buttons.size()) - 1, s, pal, font);
 						bx += bw + bgap;
 					};
 
 					if (mounted)
 					{
-						add_btn(BtnKind::VolOpen, L"Open", BtnTone::Primary, true);
+						add_btn(BtnKind::VolOpen, L"Open", BtnTone::Primary, true, f_btn, 20.0f, bh);
 						bool rw_possible = !IsPhysicalDisk(v) || g_state.allow_writes;
 						add_btn(BtnKind::VolToggleRw, rw ? L"Switch to Read-Only" : L"Enable Read-Write",
-							rw ? BtnTone::Amber : BtnTone::Neutral, rw_possible);
-						add_btn(BtnKind::VolUnmount, L"Unmount", BtnTone::Neutral, true);
+							rw ? BtnTone::Amber : BtnTone::Neutral, rw_possible, f_btn, 20.0f, bh);
+						add_btn(BtnKind::VolUnmount, L"Unmount", BtnTone::Neutral, true, f_btn, 20.0f, bh);
 					}
 					else if (locked)
 					{
-						add_btn(BtnKind::VolUnlock, L"Unlock\x2026", BtnTone::Purple, true);
+						add_btn(BtnKind::VolUnlock, L"Unlock\x2026", BtnTone::Purple, true, f_btn, 20.0f, bh);
 					}
 					else
 					{
-						add_btn(BtnKind::VolMount, L"Mount", BtnTone::Primary, true);
+						add_btn(BtnKind::VolMount, L"Mount", BtnTone::Primary, true, f_btn, 20.0f, bh);
 					}
 
-					if (!locked)
-						add_btn(BtnKind::VolToggleAuto, v.state != "disabled" ? L"Auto: On" : L"Auto: Off", BtnTone::Neutral, true);
 					if (IsPhysicalDisk(v))
-						add_btn(BtnKind::VolEject, L"Eject", BtnTone::Neutral, true);
+						add_btn(BtnKind::VolEject, L"Safely Eject", BtnTone::Neutral, true, f_btn, 20.0f, bh);
+
+					// Action buttons row 2 (volume preferences & health check)
+					bx = text_x;
+					by = card.GetBottom() - 36.0f * s;
+					float bh2 = 24.0f * s;
+					if (!locked)
+					{
+						std::wstring ltr = (v.letter.empty() || v.letter == "-") ? L"Letter\x2026" : (L"Letter: " + ToWide(v.letter));
+						add_btn(BtnKind::VolChangeLetter, ltr, BtnTone::Neutral, true, f_small, 16.0f, bh2);
+						add_btn(BtnKind::VolToggleDotfiles, v.hide_dotfiles ? L"Dotfiles: Hidden" : L"Dotfiles: Shown", BtnTone::Neutral, true, f_small, 16.0f, bh2);
+						add_btn(BtnKind::VolToggleAuto, v.state != "disabled" ? L"Auto: On" : L"Auto: Off", BtnTone::Neutral, true, f_small, 16.0f, bh2);
+					}
+					add_btn(BtnKind::VolVerify, v.verifying ? L"Verifying\x2026" : L"Verify Disk", BtnTone::Neutral, !v.verifying, f_small, 16.0f, bh2);
 				}
 
 				y += card_h + gap;
@@ -899,6 +936,9 @@ void TriggerButton(const HitButton &b)
 			case BtnKind::VolEject: if (g_cbs.on_eject) g_cbs.on_eject(v); break;
 			case BtnKind::VolToggleRw: if (g_cbs.on_toggle_rw) g_cbs.on_toggle_rw(v); break;
 			case BtnKind::VolToggleAuto: if (g_cbs.on_toggle_auto) g_cbs.on_toggle_auto(v); break;
+			case BtnKind::VolToggleDotfiles: if (g_cbs.on_toggle_dotfiles) g_cbs.on_toggle_dotfiles(v); break;
+			case BtnKind::VolChangeLetter: if (g_cbs.on_change_letter) g_cbs.on_change_letter(v); break;
+			case BtnKind::VolVerify: if (g_cbs.on_verify) g_cbs.on_verify(v); break;
 			default: break;
 			}
 		}

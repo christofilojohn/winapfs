@@ -40,11 +40,18 @@ no driver signing, nothing proprietary.
 
 ## Features
 
-- **Automatic mounting.** A background service mounts every APFS volume when a
-  disk is connected, at a drive letter it remembers, and unmounts cleanly on
-  "Safely Remove Hardware", unplugging and shutdown.
-- **Tray app.** Every volume at a glance: open, mount, unmount, eject the disk,
-  unlock encrypted volumes, switch a volume to read-write.
+- **Automatic mounting & high-speed I/O.** A background service mounts every
+  APFS volume when a disk is connected, remembers its pinned drive letter,
+  flushes writable volumes on unmount, and unmounts cleanly on "Safely Remove
+  Hardware", unplugging and shutdown. Uses 4 MiB aligned I/O batching and
+  pooled bounce buffers for fast Thunderbolt / USB4 external SSD transfers.
+- **Modern Dashboard & tray app.** Manage every volume from the Windows 11
+  Fluent Dashboard (left-click the tray icon) or tray menu: open in Explorer,
+  mount/unmount, **Safely Eject** (flush + unmount + eject confirmation), switch
+  read-only / read-write, pin drive letters (`D:`–`Z:`), toggle hiding macOS
+  dotfiles (`._*`, `.DS_Store`), view live **Read / Write MB/s** throughput and
+  disk usage, run **Verify Disk** (`winapfs-fsck`), and check for / install
+  updates directly from GitHub Releases.
 - **Faithful to the Mac side.**
   - Unicode file names exactly as stored, including characters Windows forbids
     (`: ? * | < > "`), which are mapped and round-trip
@@ -55,7 +62,8 @@ no driver signing, nothing proprietary.
   - Creation, modification and access times
   - Dotfiles and Finder-hidden files shown as hidden, as on macOS
 - **Encrypted volumes** (FileVault / encrypted APFS): read with the password or
-  recovery key (tray "Unlock…", or `--ask`).
+  recovery key (tray / Dashboard "Unlock…", optional saving in Windows
+  Credential Manager for automatic unlock, or `--ask`).
 - **Read-write** (experimental) on images and, opt-in, on physical disks, with
   conservative safety checks (see [Writing](#writing-experimental)).
 - **Several volumes per container**, GPT disks with 512- and 4096-byte sectors,
@@ -88,16 +96,23 @@ To uninstall, use *Settings → Apps*. Your disks are never touched.
 
 ## Use
 
-### Explorer and the tray
+### Explorer, Dashboard and tray
 
-APFS volumes show up under *This PC*. The **winapfs** icon in the notification
-area lists every volume with its drive letter and state. Right-click a volume to:
+APFS volumes show up under *This PC*. Left-click the **winapfs** tray icon (or
+launch **winapfs** from the Start Menu) to open the Dashboard, or right-click
+for the tray menu:
 
-- **Open** it in Explorer
-- **Mount / Unmount**, or **Eject disk** (unmounts every volume on it, then ejects)
-- **Unlock…** an encrypted volume (password or recovery key)
-- **Read-write**: allow writing to this volume (see below)
-- **Mount automatically**: on or off per volume
+- **Open** a volume in Explorer, or monitor live **Read / Write MB/s** and capacity
+- **Mount / Unmount**, or **Safely Eject** (flushes caches, unmounts every
+  volume on the disk, ejects via Windows, and notifies when safe to unplug)
+- **Unlock…** an encrypted volume (with optional Windows Credential Manager
+  storage for automatic unlock on future connections)
+- **Read-write / Read-Only**: switch access mode per volume (see below)
+- **Letter (`D:`–`Z:`)**: pin a preferred drive letter remembered per volume UUID
+- **Dotfiles / Auto-mount**: toggle hiding macOS dotfiles (`._*`, `.DS_Store`)
+  and automatic mounting per volume
+- **Verify Disk**: run `winapfs-fsck -c` against the APFS container from the UI
+- **Updates**: check GitHub Releases for newer versions and run the installer
 
 ### Command line
 
@@ -107,7 +122,10 @@ winapfs mount disk.img *                       # an image at a free drive letter
 winapfs mount \\.\PhysicalDrive2 X: --volume "Macintosh HD - Data"   # admin
 winapfs mount-all --ask                        # every volume; ask for passwords
 winapfs ctl list                               # what the service has mounted
-winapfs ctl eject Backup                       # unmount and eject a disk
+winapfs ctl set Backup DriveLetter M:          # pin a volume's drive letter
+winapfs ctl set Backup HideDotfiles 0          # show macOS dotfiles in Explorer
+winapfs ctl verify Backup                      # run winapfs-fsck -c through the service
+winapfs ctl eject Backup                       # flush, unmount and eject a disk
 winapfs-cli cat disk.img /path/in/volume       # read a file without mounting
 winapfs-fsck \\.\PhysicalDrive2                # check a container (read-only)
 ```

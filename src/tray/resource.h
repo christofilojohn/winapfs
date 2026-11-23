@@ -6,3 +6,4 @@
 #define IDC_UNLOCK_TEXT 1001
 #define IDC_PASSWORD    1002
 #define IDC_HINT        1003
+#define IDC_REMEMBER    1004

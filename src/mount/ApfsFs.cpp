@@ -916,6 +916,8 @@ static NTSTATUS Write(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULO
 	size_t written = 0;
 	int err = self->Vol().Write(node->st.inode, off, buf, len, written);
 	*transferred = static_cast<ULONG>(written);
+	if (written)
+		self->AddWriteBytes(written);
 	if (written && off + written >= size)
 		self->SetPendingSize(node->st.inode, 0);   // the data reached the size Windows set
 	{
@@ -1158,6 +1160,8 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULON
 		got = static_cast<size_t>(want);
 	}
 	*transferred = static_cast<ULONG>(got);
+	if (got)
+		self->AddReadBytes(got);
 	return STATUS_SUCCESS;
 }
 
@@ -1569,7 +1573,10 @@ void ApfsFs::Stop()
 	FspFileSystemDelete(m_fs);
 	m_fs = nullptr;
 	if (m_vol->Writable())
+	{
 		ApplyAllPendingSizes();   // handles still open at unmount
+		m_vol->Sync();
+	}
 }
 
 std::wstring ApfsFs::MountPoint() const
