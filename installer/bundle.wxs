@@ -19,9 +19,8 @@
           IconSourceFile="$(sys.SOURCEFILEDIR)..\assets\winapfs.ico"
           AboutUrl="https://github.com/FOLKGG/winapfs">
 
-    <bal:Condition Message="winapfs requires 64-bit Windows 10 or Windows 11.">
-      <![CDATA[VersionNT >= v10.0 AND VersionNT64]]>
-    </bal:Condition>
+    <bal:Condition Condition="VersionNT &gt;= v10.0 AND VersionNT64"
+                   Message="winapfs requires 64-bit Windows 10 or Windows 11." />
 
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication
