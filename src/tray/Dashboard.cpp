@@ -30,6 +30,9 @@ enum class BtnKind
 	StartService,
 	InstallService,
 	About,
+	CheckUpdates,
+	InstallUpdate,
+	OpenReleasePage,
 	VolOpen,
 	VolMount,
 	VolUnmount,
@@ -417,6 +420,54 @@ void PaintWindow(HWND hwnd)
 		float pad_y = 16.0f * s;
 		float gap = 12.0f * s;
 		float card_w = static_cast<float>(cw) - pad_x * 2.0f - (g_max_scroll > 0 ? 10.0f * s : 0.0f);
+		float y = content_top + pad_y - static_cast<float>(g_scroll_y);
+		float total_h = pad_y;
+
+		if (g_state.update_available)
+		{
+			float bh_banner = 56.0f * s;
+			Gdiplus::RectF banner(pad_x, y, card_w, bh_banner);
+			if (banner.Y + banner.Height >= content_top && banner.Y <= content_bot)
+			{
+				FillRoundRect(g, banner, 10.0f * s, pal.card_bg);
+				StrokeRoundRect(g, banner, 10.0f * s, pal.accent, 1.25f);
+
+				float after_pill = 0.0f;
+				DrawPill(g, banner.X + 14.0f * s, banner.Y + (bh_banner - 20.0f * s) * 0.5f, 20.0f * s, L"UPDATE",
+					pal.blue_pill_bg, pal.blue_pill_fg, f_pill, 8.0f * s, after_pill);
+
+				float brx = banner.GetRight() - 14.0f * s;
+				float bby = banner.Y + (bh_banner - 28.0f * s) * 0.5f;
+				float bbh = 28.0f * s;
+				auto add_banner_btn = [&](BtnKind kind, const std::wstring &label, BtnTone tone, bool enabled) {
+					float bw = MeasureTextWidth(g, label, f_btn) + 20.0f * s;
+					brx -= bw;
+					HitButton hb;
+					hb.rect = Gdiplus::RectF(brx, bby, bw, bbh);
+					hb.kind = kind;
+					hb.tone = tone;
+					hb.text = label;
+					hb.enabled = enabled;
+					g_buttons.push_back(hb);
+					DrawButton(g, hb, static_cast<int>(g_buttons.size()) - 1, s, pal, f_btn);
+					brx -= 8.0f * s;
+				};
+
+				std::wstring dl_label = g_state.update_downloading ? L"Downloading\x2026" : L"Download & Install";
+				add_banner_btn(BtnKind::InstallUpdate, dl_label, BtnTone::Primary, !g_state.update_downloading);
+				add_banner_btn(BtnKind::OpenReleasePage, L"Release Notes", BtnTone::Neutral, true);
+
+				std::wstring msg = L"winapfs v" + ToWide(g_state.update_version) + L" is available";
+				Gdiplus::SolidBrush msg_br(pal.text_primary);
+				Gdiplus::StringFormat lfmt;
+				lfmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+				lfmt.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+				lfmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+				g.DrawString(msg.c_str(), -1, &f_card_title, Gdiplus::RectF(after_pill + 10.0f * s, banner.Y, (std::max)(60.0f * s, brx - after_pill - 12.0f * s), bh_banner), &lfmt, &msg_br);
+			}
+			y += bh_banner + gap;
+			total_h += bh_banner + gap;
+		}
 
 		if (g_state.vols.empty())
 		{
@@ -424,7 +475,8 @@ void PaintWindow(HWND hwnd)
 			g_scroll_y = 0;
 			float box_w = (std::min)(480.0f * s, static_cast<float>(cw) - 40.0f * s);
 			float box_h = 164.0f * s;
-			Gdiplus::RectF box((static_cast<float>(cw) - box_w) * 0.5f, content_top + (view_h - box_h) * 0.45f, box_w, box_h);
+			float empty_top = g_state.update_available ? y + 10.0f * s : content_top + (view_h - box_h) * 0.45f;
+			Gdiplus::RectF box((static_cast<float>(cw) - box_w) * 0.5f, empty_top, box_w, box_h);
 			FillRoundRect(g, box, 12.0f * s, pal.card_bg);
 			StrokeRoundRect(g, box, 12.0f * s, pal.card_border, 1.0f);
 
@@ -466,8 +518,6 @@ void PaintWindow(HWND hwnd)
 		}
 		else
 		{
-			float y = content_top + pad_y - static_cast<float>(g_scroll_y);
-			float total_h = pad_y;
 
 			for (size_t i = 0; i < g_state.vols.size(); i++)
 			{
@@ -701,21 +751,23 @@ void PaintWindow(HWND hwnd)
 			float rx = static_cast<float>(cw) - 20.0f * s;
 			float by = (header_h - 30.0f * s) * 0.5f;
 			float bh = 30.0f * s;
-			auto add_hdr_btn = [&](BtnKind kind, const std::wstring &label, BtnTone tone) {
-				float bw = MeasureTextWidth(g, label, f_btn) + 22.0f * s;
+			auto add_hdr_btn = [&](BtnKind kind, const std::wstring &label, BtnTone tone, bool enabled = true) {
+				float bw = MeasureTextWidth(g, label, f_btn) + 20.0f * s;
 				rx -= bw;
 				HitButton hb;
 				hb.rect = Gdiplus::RectF(rx, by, bw, bh);
 				hb.kind = kind;
 				hb.tone = tone;
 				hb.text = label;
-				hb.enabled = true;
+				hb.enabled = enabled;
 				g_buttons.push_back(hb);
 				DrawButton(g, hb, static_cast<int>(g_buttons.size()) - 1, s, pal, f_btn);
 				rx -= 8.0f * s;
 			};
 
 			add_hdr_btn(BtnKind::About, L"About", BtnTone::Neutral);
+			add_hdr_btn(BtnKind::CheckUpdates, g_state.update_checking ? L"Checking\x2026" : L"Updates",
+				g_state.update_available ? BtnTone::Primary : BtnTone::Neutral, !g_state.update_checking);
 			if (g_state.service_up)
 			{
 				add_hdr_btn(BtnKind::Rescan, L"Rescan", BtnTone::Neutral);
@@ -746,17 +798,23 @@ void PaintWindow(HWND hwnd)
 			lfmt.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
 			lfmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
 			std::wstring notice = L"Uses WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos";
-			g.DrawString(notice.c_str(), -1, &f_small, Gdiplus::RectF(20.0f * s, content_bot, static_cast<float>(cw) - 180.0f * s, footer_h), &lfmt, &m_br);
+			g.DrawString(notice.c_str(), -1, &f_small, Gdiplus::RectF(20.0f * s, content_bot, (std::max)(120.0f * s, static_cast<float>(cw) - 300.0f * s), footer_h), &lfmt, &m_br);
 
 			size_t mounted_cnt = 0;
 			for (const auto &v : g_state.vols)
 				mounted_cnt += (v.state == "mounted");
 			std::wstring summary = g_state.vols.empty() ? L""
 				: std::to_wstring(mounted_cnt) + L" of " + std::to_wstring(g_state.vols.size()) + L" mounted";
+			if (!g_state.update_available && !g_state.update_status.empty())
+			{
+				if (!summary.empty())
+					summary += L"  \x2022  ";
+				summary += ToWide(g_state.update_status);
+			}
 			Gdiplus::StringFormat rfmt;
 			rfmt.SetAlignment(Gdiplus::StringAlignmentFar);
 			rfmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-			g.DrawString(summary.c_str(), -1, &f_small, Gdiplus::RectF(static_cast<float>(cw) - 180.0f * s, content_bot, 160.0f * s, footer_h), &rfmt, &m_br);
+			g.DrawString(summary.c_str(), -1, &f_small, Gdiplus::RectF(static_cast<float>(cw) - 280.0f * s, content_bot, 260.0f * s, footer_h), &rfmt, &m_br);
 		}
 	}
 
@@ -814,6 +872,18 @@ void TriggerButton(const HitButton &b)
 	case BtnKind::About:
 		if (g_cbs.on_about)
 			g_cbs.on_about();
+		break;
+	case BtnKind::CheckUpdates:
+		if (g_cbs.on_check_updates)
+			g_cbs.on_check_updates();
+		break;
+	case BtnKind::InstallUpdate:
+		if (g_cbs.on_install_update)
+			g_cbs.on_install_update();
+		break;
+	case BtnKind::OpenReleasePage:
+		if (g_cbs.on_open_release_page)
+			g_cbs.on_open_release_page();
 		break;
 	default:
 		if (b.vol_index < 0 || static_cast<size_t>(b.vol_index) >= g_state.vols.size())
@@ -875,8 +945,8 @@ LRESULT CALLBACK DashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	{
 		auto *mmi = reinterpret_cast<MINMAXINFO *>(lp);
 		float s = static_cast<float>(g_dpi) / 96.0f;
-		mmi->ptMinTrackSize.x = static_cast<LONG>(680.0f * s);
-		mmi->ptMinTrackSize.y = static_cast<LONG>(480.0f * s);
+		mmi->ptMinTrackSize.x = static_cast<LONG>(740.0f * s);
+		mmi->ptMinTrackSize.y = static_cast<LONG>(500.0f * s);
 		return 0;
 	}
 
@@ -1033,8 +1103,8 @@ void DashboardShow()
 			ReleaseDC(nullptr, sdc);
 		}
 		float s = static_cast<float>(dpi) / 96.0f;
-		int w = static_cast<int>(760.0f * s);
-		int h = static_cast<int>(540.0f * s);
+		int w = static_cast<int>(800.0f * s);
+		int h = static_cast<int>(560.0f * s);
 		RECT wa = {};
 		SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
 		int x = wa.left + ((wa.right - wa.left) - w) / 2;

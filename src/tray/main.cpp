@@ -16,6 +16,7 @@
 
 #include "Control.h"
 #include "Dashboard.h"
+#include "Updater.h"
 #include "resource.h"
 
 #include <Windows.h>
@@ -37,9 +38,12 @@ using namespace winapfs;
 namespace {
 
 constexpr UINT WM_TRAY = WM_APP + 1;
-constexpr UINT WM_ACTION_DONE = WM_APP + 2;   // lParam: new std::wstring (message) or null
-constexpr UINT WM_POLL_DONE = WM_APP + 3;     // lParam: new PollUiUpdate
+constexpr UINT WM_ACTION_DONE = WM_APP + 2;          // lParam: new std::wstring (message) or null
+constexpr UINT WM_POLL_DONE = WM_APP + 3;            // lParam: new PollUiUpdate
+constexpr UINT WM_UPDATE_RESULT = WM_APP + 4;        // lParam: new UpdateResultMsg
+constexpr UINT WM_UPDATE_DOWNLOAD_DONE = WM_APP + 5; // lParam: new UpdateDownloadMsg
 constexpr UINT_PTR TIMER_POLL = 1;
+constexpr UINT_PTR TIMER_STARTUP_UPDATE = 2;
 constexpr UINT kPollMs = 2500;
 
 enum MenuId : UINT
@@ -49,6 +53,7 @@ enum MenuId : UINT
 	ID_RESCAN,
 	ID_SERVICE_START,
 	ID_SERVICE_INSTALL,
+	ID_CHECK_UPDATES,
 	ID_ABOUT,
 	ID_EXIT,
 	ID_VOLUME_BASE = 1000,   // + 10 * volume index + action
@@ -82,14 +87,45 @@ bool g_first_poll = true;
 std::string g_balloon_uuid;            // a locked volume the last notification was about
 std::atomic<bool> g_polling{ false };
 std::atomic<bool> g_exiting{ false };
+std::atomic<bool> g_checking_update{ false };
+std::atomic<bool> g_downloading_update{ false };
+UpdateInfo g_update;
+std::string g_update_status_text;
+DashboardState g_last_dash;
+bool g_last_balloon_is_update = false;
 
 struct PollUiUpdate
 {
 	std::wstring tip;
 	std::wstring notify_title;
 	std::wstring notify_text;
+	bool has_locked_note = false;
 	DashboardState dash;
 };
+
+struct UpdateResultMsg
+{
+	UpdateInfo info;
+	bool interactive = false;
+};
+
+struct UpdateDownloadMsg
+{
+	bool ok = false;
+	std::wstring path;
+	std::string err;
+};
+
+void SyncDashboardState(DashboardState s)
+{
+	s.update_checking = g_checking_update.load();
+	s.update_downloading = g_downloading_update.load();
+	s.update_available = g_update.ok && g_update.update_available;
+	s.update_version = g_update.latest_version;
+	s.update_status = g_update_status_text;
+	g_last_dash = s;
+	DashboardUpdate(g_last_dash);
+}
 
 HWND DialogOwner()
 {
@@ -253,6 +289,7 @@ void StartPollAsync()
 		{
 			upd->notify_title = notes.back().first;
 			upd->notify_text = notes.size() == 1 ? notes.back().second : notes.back().second + L" (and more)";
+			upd->has_locked_note = !locked_uuid.empty();
 		}
 		g_polling.store(false);
 		if (g_exiting.load() || !PostMessageW(g_wnd, WM_POLL_DONE, 0, reinterpret_cast<LPARAM>(upd)))
@@ -456,6 +493,50 @@ void ActionInstallService()
 	}).detach();
 }
 
+void ActionOpenReleasePage()
+{
+	std::string url = !g_update.release_url.empty() ? g_update.release_url : "https://github.com/FOLKGG/winapfs/releases";
+	ShellExecuteW(nullptr, L"open", W(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void ActionCheckUpdates(bool interactive)
+{
+	if (g_exiting.load() || g_checking_update.exchange(true))
+		return;
+	SyncDashboardState(g_last_dash);
+	std::thread([interactive] {
+		auto *res = new UpdateResultMsg;
+		res->info = CheckForUpdates(WINAPFS_VERSION_STR);
+		res->interactive = interactive;
+		g_checking_update.store(false);
+		if (g_exiting.load() || !PostMessageW(g_wnd, WM_UPDATE_RESULT, 0, reinterpret_cast<LPARAM>(res)))
+			delete res;
+	}).detach();
+}
+
+void ActionInstallUpdate()
+{
+	if (g_exiting.load() || g_downloading_update.load())
+		return;
+	if (g_update.download_url.empty())
+	{
+		ActionOpenReleasePage();
+		return;
+	}
+	if (g_downloading_update.exchange(true))
+		return;
+	std::string url = g_update.download_url;
+	std::string asset = g_update.asset_name;
+	SyncDashboardState(g_last_dash);
+	std::thread([url, asset] {
+		auto *dl = new UpdateDownloadMsg;
+		dl->ok = DownloadUpdateInstaller(url, asset, dl->path, dl->err);
+		g_downloading_update.store(false);
+		if (g_exiting.load() || !PostMessageW(g_wnd, WM_UPDATE_DOWNLOAD_DONE, 0, reinterpret_cast<LPARAM>(dl)))
+			delete dl;
+	}).detach();
+}
+
 // ---------------------------------------------------------------- menu
 
 void About()
@@ -541,6 +622,7 @@ void ShowMenu()
 		AppendMenuW(m, MF_STRING, ID_SERVICE_START, L"Start the winapfs service");
 	else
 		AppendMenuW(m, MF_STRING, ID_SERVICE_INSTALL, L"Install the winapfs service\x2026");
+	AppendMenuW(m, MF_STRING, ID_CHECK_UPDATES, L"Check for updates\x2026");
 	AppendMenuW(m, MF_STRING, ID_ABOUT, L"About winapfs");
 	AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
 
@@ -588,6 +670,9 @@ void ShowMenu()
 	case ID_SERVICE_INSTALL:
 		ActionInstallService();
 		break;
+	case ID_CHECK_UPDATES:
+		ActionCheckUpdates(true);
+		break;
 	case ID_ABOUT:
 		About();
 		break;
@@ -634,6 +719,12 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 			break;
 		case NIN_BALLOONUSERCLICK:
 		{
+			if (g_last_balloon_is_update)
+			{
+				DashboardShow();
+				StartPollAsync();
+				break;
+			}
 			VolumeStatus v;
 			{
 				std::lock_guard<std::mutex> lock(g_mutex);
@@ -650,6 +741,11 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_TIMER:
 		if (wp == TIMER_POLL)
 			StartPollAsync();
+		else if (wp == TIMER_STARTUP_UPDATE)
+		{
+			KillTimer(wnd, TIMER_STARTUP_UPDATE);
+			ActionCheckUpdates(false);
+		}
 		return 0;
 	case WM_POLL_DONE:
 	{
@@ -658,9 +754,74 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 		{
 			SetTip(upd->tip);
 			if (!upd->notify_title.empty())
+			{
+				if (upd->has_locked_note)
+					g_last_balloon_is_update = false;
 				Notify(upd->notify_title, upd->notify_text);
-			DashboardUpdate(upd->dash);
+			}
+			SyncDashboardState(upd->dash);
 			delete upd;
+		}
+		return 0;
+	}
+	case WM_UPDATE_RESULT:
+	{
+		auto *res = reinterpret_cast<UpdateResultMsg *>(lp);
+		if (res)
+		{
+			if (res->info.ok)
+			{
+				g_update = res->info;
+				g_update_status_text = res->info.update_available ? "" : "Up to date";
+				SyncDashboardState(g_last_dash);
+				if (res->info.update_available)
+				{
+					std::wstring ver = W(res->info.latest_version);
+					g_last_balloon_is_update = true;
+					Notify(L"winapfs update available", L"winapfs v" + ver + L" is ready to install.");
+					if (res->interactive && (!DashboardHwnd() || !IsWindowVisible(DashboardHwnd())))
+					{
+						if (MessageBoxW(DialogOwner(),
+							(L"winapfs v" + ver + L" is available (you have v" WINAPFS_VERSION_W L").\n\nDownload and install it now?").c_str(),
+							L"winapfs Update", MB_YESNO | MB_ICONINFORMATION) == IDYES)
+						{
+							ActionInstallUpdate();
+						}
+					}
+				}
+				else if (res->interactive)
+				{
+					MessageBoxW(DialogOwner(), L"winapfs v" WINAPFS_VERSION_W L" is up to date.", L"winapfs Update", MB_OK | MB_ICONINFORMATION);
+				}
+			}
+			else
+			{
+				g_update_status_text = "";
+				SyncDashboardState(g_last_dash);
+				if (res->interactive)
+					MessageBoxW(DialogOwner(), (L"Could not check for updates:\n\n" + W(res->info.error)).c_str(), L"winapfs Update", MB_OK | MB_ICONWARNING);
+			}
+			delete res;
+		}
+		return 0;
+	}
+	case WM_UPDATE_DOWNLOAD_DONE:
+	{
+		auto *dl = reinterpret_cast<UpdateDownloadMsg *>(lp);
+		if (dl)
+		{
+			SyncDashboardState(g_last_dash);
+			if (dl->ok)
+			{
+				HINSTANCE r = ShellExecuteW(DialogOwner(), L"open", dl->path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+				if (reinterpret_cast<INT_PTR>(r) <= 32)
+					Notify(L"winapfs update", L"Downloaded to " + dl->path + L" (could not launch installer automatically).", NIIF_WARNING);
+			}
+			else
+			{
+				Notify(L"winapfs update failed", W(dl->err), NIIF_WARNING);
+			}
+			delete dl;
 		}
 		return 0;
 	}
@@ -679,6 +840,7 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 		g_exiting.store(true);
 		DashboardDestroy();
 		KillTimer(wnd, TIMER_POLL);
+		KillTimer(wnd, TIMER_STARTUP_UPDATE);
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
 		PostQuitMessage(0);
 		return 0;
@@ -753,6 +915,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 	dash_cbs.on_start_service = ActionStartService;
 	dash_cbs.on_install_service = ActionInstallService;
 	dash_cbs.on_about = About;
+	dash_cbs.on_check_updates = [] { ActionCheckUpdates(true); };
+	dash_cbs.on_install_update = ActionInstallUpdate;
+	dash_cbs.on_open_release_page = ActionOpenReleasePage;
 	DashboardInit(inst, g_wnd, std::move(dash_cbs));
 
 	// the logo, at the notification area's size for this DPI
@@ -772,6 +937,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 		DashboardShow();
 	StartPollAsync();
 	SetTimer(g_wnd, TIMER_POLL, kPollMs, nullptr);
+	SetTimer(g_wnd, TIMER_STARTUP_UPDATE, 10000, nullptr);
 
 	MSG msg;
 	while (GetMessageW(&msg, nullptr, 0, 0) > 0)

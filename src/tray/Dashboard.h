@@ -26,6 +26,11 @@ struct DashboardState
 	bool service_up = false;
 	bool service_installed = false;
 	bool allow_writes = false;
+	bool update_checking = false;
+	bool update_downloading = false;
+	bool update_available = false;
+	std::string update_version;
+	std::string update_status;
 	std::vector<VolumeCardData> vols;
 };
 
@@ -43,6 +48,9 @@ struct DashboardCallbacks
 	std::function<void()> on_start_service;
 	std::function<void()> on_install_service;
 	std::function<void()> on_about;
+	std::function<void()> on_check_updates;
+	std::function<void()> on_install_update;
+	std::function<void()> on_open_release_page;
 };
 
 void DashboardInit(HINSTANCE inst, HWND owner_tray_wnd, DashboardCallbacks cbs);
