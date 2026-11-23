@@ -162,6 +162,8 @@ std::wstring StateText(const VolumeStatus &v)
 
 // ---------------------------------------------------------------- polling
 
+bool ServiceInstalled();
+
 void StartPollAsync()
 {
 	if (g_exiting.load() || g_polling.exchange(true))
