@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  winapfs setup bundle (WiX 5 Burn). Built by installer\build.ps1 when -WinFspMsi is passed:
+    Version    x.y.z (from CMakeLists.txt)
+    WinFspMsi  path to the unmodified WinFsp 2.x MSI
+    WinapfsMsi path to winapfs-<version>-x64.msi
+    ObjDir     generated files: license.rtf
+  Chains WinFsp (marked Permanent so uninstalling winapfs keeps WinFsp) followed by
+  the winapfs MSI into a single self-contained winapfs-<version>-x64-setup.exe.
+  SPDX-License-Identifier: GPL-2.0-or-later
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+
+  <Bundle Name="winapfs (APFS for Windows)"
+          Manufacturer="winapfs contributors"
+          Version="$(var.Version)"
+          UpgradeCode="A91B4C6D-2E8F-4F31-9A7B-3D5E1C8B2F04"
+          IconSourceFile="$(sys.SOURCEFILEDIR)..\assets\winapfs.ico"
+          AboutUrl="https://github.com/FOLKGG/winapfs">
+
+    <bal:Condition Message="winapfs requires 64-bit Windows 10 or Windows 11.">
+      <![CDATA[VersionNT >= v10.0 AND VersionNT64]]>
+    </bal:Condition>
+
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+          Theme="rtfLicense"
+          LicenseFile="$(var.ObjDir)\license.rtf"
+          LogoFile="$(sys.SOURCEFILEDIR)..\assets\logo-256.png"
+          ShowVersion="yes"
+          SuppressOptionsUI="yes"
+          LaunchTarget="[ProgramFiles64Folder]winapfs\winapfs-tray.exe" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <MsiPackage Id="WinFspMsi"
+                  SourceFile="$(var.WinFspMsi)"
+                  Compressed="yes"
+                  Permanent="yes"
+                  Vital="yes"
+                  Visible="yes" />
+      <MsiPackage Id="WinapfsMsi"
+                  SourceFile="$(var.WinapfsMsi)"
+                  Compressed="yes"
+                  Vital="yes"
+                  Visible="no" />
+    </Chain>
+  </Bundle>
+</Wix>

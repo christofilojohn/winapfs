@@ -26,7 +26,7 @@ jobs:
 
       - name: Install WinFsp SDK
         run: |
-          $msi = Join-Path $env:TEMP 'winfsp.msi'
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp-2.2.26323.msi'
           Invoke-WebRequest -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.2/winfsp-2.2.26323.msi' -OutFile $msi
           $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i', $msi, '/qn', 'ADDLOCAL=ALL'
           if ($proc.ExitCode -notin 0, 3010) {
@@ -48,7 +48,7 @@ jobs:
           $dotnetTools = Join-Path $env:USERPROFILE '.dotnet\tools'
           $dotnetTools | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           $env:PATH = "$dotnetTools;$env:PATH"
-          wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2 WixToolset.BootstrapperApplications.wixext/5.0.2
           if ($LASTEXITCODE -ne 0) { throw "wix extension add failed ($LASTEXITCODE)" }
 
       - name: Configure and build Release (x64)
@@ -61,13 +61,23 @@ jobs:
           ctest --test-dir build -C Release -R "^unit\." --output-on-failure
           if ($LASTEXITCODE -ne 0) { throw "ctest failed ($LASTEXITCODE)" }
 
-      - name: Build MSI installer
+      - name: Build MSI and setup bundle
         run: |
-          powershell -ExecutionPolicy Bypass -File installer\build.ps1
+          $winfspMsi = Join-Path $env:RUNNER_TEMP 'winfsp-2.2.26323.msi'
+          powershell -ExecutionPolicy Bypass -File installer\build.ps1 -WinFspMsi $winfspMsi
           if ($LASTEXITCODE -ne 0) { throw "installer\build.ps1 failed ($LASTEXITCODE)" }
           $msiFiles = Get-ChildItem -Path dist -Filter 'winapfs-*-x64.msi'
           if (-not $msiFiles) { throw "No MSI file generated in dist\" }
-          $msiFiles | ForEach-Object { Write-Output "Verified MSI: $($_.FullName)" }
+          $setupFiles = Get-ChildItem -Path dist -Filter 'winapfs-*-x64-setup.exe'
+          if (-not $setupFiles) { throw "No setup bundle generated in dist\" }
+          $msiFiles + $setupFiles | ForEach-Object { Write-Output "Verified installer: $($_.FullName)" }
+
+      - name: Upload setup bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: winapfs-setup-x64
+          path: dist/winapfs-*-x64-setup.exe
+          if-no-files-found: error
 
       - name: Upload MSI artifact
         uses: actions/upload-artifact@v4
@@ -94,10 +104,11 @@ jobs:
         run: |
           $tag = $env:GITHUB_REF_NAME
           $msi = (Get-ChildItem -Path dist -Filter 'winapfs-*-x64.msi' | Select-Object -First 1).FullName
-          if (-not $msi) { throw "Missing MSI artifact for release" }
+          $setup = (Get-ChildItem -Path dist -Filter 'winapfs-*-x64-setup.exe' | Select-Object -First 1).FullName
+          if (-not $msi -or -not $setup) { throw "Missing installer artifacts for release" }
           if (gh release view $tag 2>$null) {
-            gh release upload $tag $msi --clobber
+            gh release upload $tag $msi $setup --clobber
           } else {
-            gh release create $tag $msi --title "winapfs $tag" --generate-notes
+            gh release create $tag $msi $setup --title "winapfs $tag" --generate-notes
           }
           if ($LASTEXITCODE -ne 0) { throw "gh release failed ($LASTEXITCODE)" }
