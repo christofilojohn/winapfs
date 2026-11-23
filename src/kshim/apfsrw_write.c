@@ -495,7 +495,7 @@ int apfsrw_removexattr(apfsrw_node *n, const char *name)
  */
 int apfsrw_decompress(apfsrw_node *dir, const char *name, size_t len, apfsrw_node **out)
 {
-	enum { CHUNK = 1 << 20 };
+	enum { CHUNK = 4 << 20 };
 	apfsrw_node *src = NULL, *tmp = NULL;
 	apfsrw_file *in = NULL, *outf = NULL;
 	apfsrw_stat st;

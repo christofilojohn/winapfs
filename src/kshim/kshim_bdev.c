@@ -151,8 +151,8 @@ int kshim_bdev_register(const wchar_t *path, u64 offset, u64 size, bool writable
 	b->bdev.bd_disk = &b->disk;
 	b->bdev.bd_mapping = &b->mapping;
 	b->disk.bdi = &b->bdi;
-	b->bdi.ra_pages = 32;
-	b->bdi.io_pages = 256;
+	b->bdi.ra_pages = 1024;
+	b->bdi.io_pages = 1024;
 	snprintf(b->bdev.bd_name, sizeof(b->bdev.bd_name), "kshim%d", i);
 	snprintf(b->disk.disk_name, sizeof(b->disk.disk_name), "kshim%d", i);
 	kshim_mapping_init(&b->mapping, NULL);

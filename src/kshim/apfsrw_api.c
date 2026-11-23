@@ -285,11 +285,11 @@ int apfsrw_read(apfsrw_file *af, uint64_t off, void *buf, size_t len, size_t *go
 
 	/*
 	 * Bring the range into the page cache with large device reads (the
-	 * driver's readahead op, batched by mpage_readahead), plus 1 MiB ahead for
+	 * driver's readahead op, batched by mpage_readahead), plus 4 MiB ahead for
 	 * a sequential reader; read_mapping_folio below then finds every page.
 	 */
 	{
-		const u64 window = 1u << 20;
+		const u64 window = 4u << 20;
 		u64 from = off, to = off + len;
 		if (off == af->ra_next)
 			to = max(to, off + window);
