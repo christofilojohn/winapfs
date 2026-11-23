@@ -1208,17 +1208,17 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 			}
 			else if (res->exit_code == 0)
 			{
-				std::wstring msg = L"\"" + res->name + L"\" passed winapfs-fsck integrity verification (exit code 0).";
+				std::wstring text = L"\"" + res->name + L"\" passed winapfs-fsck integrity verification (exit code 0).";
 				if (!res->output.empty())
-					msg += L"\n\nDetails:\n" + W(res->output);
-				MessageBoxW(DialogOwner(), msg.c_str(), L"Verify APFS Disk", MB_OK | MB_ICONINFORMATION);
+					text += L"\n\nDetails:\n" + W(res->output);
+				MessageBoxW(DialogOwner(), text.c_str(), L"Verify APFS Disk", MB_OK | MB_ICONINFORMATION);
 			}
 			else
 			{
-				std::wstring msg = L"winapfs-fsck reported issues on \"" + res->name + L"\" (exit code " + std::to_wstring(res->exit_code) + L").";
+				std::wstring text = L"winapfs-fsck reported issues on \"" + res->name + L"\" (exit code " + std::to_wstring(res->exit_code) + L").";
 				if (!res->output.empty())
-					msg += L"\n\nDetails:\n" + W(res->output);
-				MessageBoxW(DialogOwner(), msg.c_str(), L"Verify APFS Disk", MB_OK | MB_ICONWARNING);
+					text += L"\n\nDetails:\n" + W(res->output);
+				MessageBoxW(DialogOwner(), text.c_str(), L"Verify APFS Disk", MB_OK | MB_ICONWARNING);
 			}
 			delete res;
 		}
