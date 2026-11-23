@@ -27,6 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          chmod +x testdata/generator/*.sh
           bash testdata/generator/make_images.sh
           ls -lh testdata/generator/images
           tar -czf apfs-test-images.tar.gz -C testdata/generator/images .
