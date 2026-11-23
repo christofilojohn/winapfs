@@ -10,6 +10,17 @@ target_include_directories(winapfs-names-test PRIVATE ${CMAKE_SOURCE_DIR}/src/co
 target_compile_options(winapfs-names-test PRIVATE /W4)
 add_test(NAME unit.names COMMAND winapfs-names-test)
 
+# Control pipe helpers & updater security/version checks (no images needed)
+add_executable(winapfs-control-test control_test.cpp
+	${CMAKE_SOURCE_DIR}/src/mount/Control.cpp
+	${CMAKE_SOURCE_DIR}/src/tray/Updater.cpp)
+target_include_directories(winapfs-control-test PRIVATE ${CMAKE_SOURCE_DIR}/src/mount ${CMAKE_SOURCE_DIR}/src/tray)
+target_include_directories(winapfs-control-test SYSTEM PRIVATE ${TP})
+target_compile_definitions(winapfs-control-test PRIVATE WINAPFS_VERSION_W=L"${PROJECT_VERSION}")
+target_link_libraries(winapfs-control-test PRIVATE winhttp)
+target_compile_options(winapfs-control-test PRIVATE /W4)
+add_test(NAME unit.control COMMAND winapfs-control-test)
+
 set(TD ${CMAKE_SOURCE_DIR}/testdata)
 set(TEST_PASSWORD winapfs-test)
 

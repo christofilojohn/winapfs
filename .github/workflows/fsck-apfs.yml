@@ -8,8 +8,9 @@ on:
       - 'src/kshim/**'
       - 'src/core/**'
       - 'src/mount/**'
+      - 'src/tray/**'
       - 'third_party/linux-apfs-rw/**'
-      - 'tests/writetest.cpp'
+      - 'tests/**'
       - '.github/workflows/fsck-apfs.yml'
 
 permissions:
@@ -26,46 +27,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          WORK="$(mktemp -d -t winapfs-gen)"
-          OUT="$PWD/generated"
-          DISK=""
-          cleanup() {
-            [[ -n "$DISK" ]] && hdiutil detach -force "$DISK" >/dev/null 2>&1 || true
-            rm -rf "$WORK"
-          }
-          trap cleanup EXIT
-          mkdir -p "$OUT" "$WORK/mnt" "$WORK/ro"
-
-          make_one() {
-            local name=$1 size=$2 fs=$3 vol=$4 profile=$5
-            echo "=== Generating $name.img ($fs / $vol) ==="
-            hdiutil create -quiet -size "$size" -fs "$fs" -volname "$vol" -layout GPTSPUD "$WORK/$name.dmg"
-            local out mp
-            out=$(hdiutil attach -nobrowse -owners on -mountroot "$WORK/mnt" "$WORK/$name.dmg" 2>/dev/null)
-            DISK=$(awk '$2 == "GUID_partition_scheme" {print $1; exit}' <<<"$out")
-            [[ -n "$DISK" ]] || DISK=$(awk 'NR==1{print $1}' <<<"$out")
-            mp=$(cd "$WORK/mnt/$vol" && pwd -P)
-            python3 testdata/generator/tool.py populate "$mp" "$profile"
-            sync
-            hdiutil detach -quiet "$DISK"; DISK=""
-            hdiutil convert -quiet "$WORK/$name.dmg" -format UDTO -o "$WORK/$name"
-            mv "$WORK/$name.cdr" "$OUT/$name.img"
-            rm -f "$WORK/$name.dmg"
-
-            out=$(hdiutil attach -readonly -nobrowse -owners on -mountroot "$WORK/ro" -imagekey diskimage-class=CRawDiskImage "$OUT/$name.img" 2>/dev/null)
-            DISK=$(awk '$2 == "GUID_partition_scheme" {print $1; exit}' <<<"$out")
-            [[ -n "$DISK" ]] || DISK=$(awk 'NR==1{print $1}' <<<"$out")
-            python3 testdata/generator/tool.py manifest "$WORK/ro/$vol" "$OUT/$name.$vol.manifest.json"
-            hdiutil detach -quiet "$DISK"; DISK=""
-          }
-
-          make_one basic 128m APFS Basic basic
-          make_one compressed 64m APFS Compressed compressed
-          make_one links 32m APFS Links links
-          make_one casesensitive 32m "Case-sensitive APFS" CaseSens casesensitive
-
-          ls -lh "$OUT"
-          tar -czf apfs-test-images.tar.gz -C "$OUT" .
+          bash testdata/generator/make_images.sh
+          ls -lh testdata/generator/images
+          tar -czf apfs-test-images.tar.gz -C testdata/generator/images .
+          ls -lh apfs-test-images.tar.gz
 
       - name: Upload generated APFS images
         uses: actions/upload-artifact@v4
@@ -96,6 +61,8 @@ jobs:
         run: |
           tar -xzf apfs-test-images.tar.gz -C testdata
           if ($LASTEXITCODE -ne 0) { throw "Failed to extract apfs-test-images.tar.gz" }
+          Remove-Item apfs-test-images.tar.gz -Force
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,2)}}
 
       - name: Install WinFsp SDK
         run: |
@@ -111,26 +78,64 @@ jobs:
           cmd /c build.cmd Release
           if ($LASTEXITCODE -ne 0) { throw "build.cmd Release failed ($LASTEXITCODE)" }
 
-      - name: Run apfsrw-writetest and winapfs-fsck
+      - name: Run full staged ctest suite and collect written images
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
-          $cases = @(
-            @{ Img = 'basic.img'; Manifest = 'basic.Basic.manifest.json'; Vol = 'Basic'; Out = 'basic.written.img' },
-            @{ Img = 'compressed.img'; Manifest = 'compressed.Compressed.manifest.json'; Vol = 'Compressed'; Out = 'compressed.written.img' },
-            @{ Img = 'links.img'; Manifest = 'links.Links.manifest.json'; Vol = 'Links'; Out = 'links.written.img' },
-            @{ Img = 'casesensitive.img'; Manifest = 'casesensitive.CaseSens.manifest.json'; Vol = 'CaseSens'; Out = 'casesensitive.written.img' }
+          $stages = @(
+            '^(unit|image|cli|mount\.|mount_all|rawdev|mount_rawdev|rwengine|mount_case|mount_lib|mount_dotfiles|fsck)',
+            '^(write\.|write_fsck|mountwrite)',
+            '^(crash|diskfull|prealloc|dirquery)',
+            '^w5_',
+            '^service\.',
+            '^(pagecache|inodecache)'
           )
-          foreach ($c in $cases) {
-            $manifest = "testdata\$($c.Manifest)"
-            $src = "testdata\$($c.Img)"
-            $work = "out\$($c.Out)"
-            Write-Output "=== apfsrw-writetest: $($c.Img) ($($c.Vol)) ==="
-            & .\build\tests\Release\apfsrw-writetest.exe $manifest $src $work $c.Vol
-            if ($LASTEXITCODE -ne 0) { throw "apfsrw-writetest failed on $($c.Img) ($LASTEXITCODE)" }
-            Write-Output "=== winapfs-fsck -c: $work ==="
-            & .\build\src\fsck\Release\winapfs-fsck.exe -c $work
-            if ($LASTEXITCODE -ne 0) { throw "winapfs-fsck failed on $work ($LASTEXITCODE)" }
+          $allNames = @(& ctest --test-dir build -C Release -N | ForEach-Object { if ($_ -match '^\s*Test\s+#\d+:\s+(\S+)') { $Matches[1] } })
+          Write-Output "Total discovered CTest tests: $($allNames.Count)"
+          if ($allNames.Count -lt 100) { throw "Expected full test suite (~150 tests), found $($allNames.Count)" }
+          $uncovered = @($allNames | Where-Object { $n = $_; -not ($stages | Where-Object { $n -match $_ }) })
+          if ($uncovered.Count -gt 0) {
+            throw "Uncovered tests in stages: $($uncovered -join ', ')"
           }
+
+          $cleanups = @(
+            { Remove-Item 'build\tests\corrupt-*.img' -Force -ErrorAction SilentlyContinue },
+            {
+              foreach ($pair in @(
+                @('w32-basic.img', 'basic.written.img'),
+                @('w32-compressed.img', 'compressed.written.img'),
+                @('w32-links.img', 'links.written.img'),
+                @('w32-casesensitive.img', 'casesensitive.written.img'),
+                @('w32-multivol.img', 'multivol.written.img')
+              )) {
+                $src = Join-Path 'build\tests' $pair[0]
+                if (-not (Test-Path $src)) { throw "Missing expected WinFsp-written image: $src" }
+                Move-Item $src (Join-Path 'out' $pair[1]) -Force
+              }
+              Remove-Item 'build\tests\w3-*.img', 'build\tests\w32-*.img' -Force -ErrorAction SilentlyContinue
+            },
+            { Remove-Item 'build\tests\crash-*.img*', 'build\tests\full-*.img*', 'build\tests\prealloc-*.img', 'build\tests\dirquery-*.img' -Force -ErrorAction SilentlyContinue },
+            {
+              $mv = 'build\tests\w5-multivol.img'
+              if (-not (Test-Path $mv)) { throw "Missing $mv" }
+              Move-Item $mv 'out\w5-multivol.written.img' -Force
+              Remove-Item 'build\tests\unclean-*.img*', 'build\tests\w5raw-*.img*', 'build\tests\w5-multivol.img' -Force -ErrorAction SilentlyContinue
+            },
+            { Remove-Item 'build\tests\svc-*.img', 'build\tests\ctl-*.img' -Force -ErrorAction SilentlyContinue },
+            { Remove-Item 'build\tests\pagecache-*.img', 'build\tests\inodecache-*.img' -Force -ErrorAction SilentlyContinue }
+          )
+
+          for ($i = 0; $i -lt $stages.Count; $i++) {
+            $rx = $stages[$i]
+            Write-Output "========================================"
+            Write-Output "Stage $($i + 1)/$($stages.Count): ctest -R '$rx'"
+            Write-Output "========================================"
+            & ctest --test-dir build -C Release -R $rx --output-on-failure --timeout 300
+            if ($LASTEXITCODE -ne 0) { throw "CTest stage $($i + 1) failed ($LASTEXITCODE)" }
+            & $cleanups[$i]
+            $freeGB = [math]::Round((Get-PSDrive D -ErrorAction SilentlyContinue).Free / 1GB, 2)
+            Write-Output "Stage $($i + 1) complete (D: free = $freeGB GB)"
+          }
+
           tar -czf apfs-written-images.tar.gz -C out .
           if ($LASTEXITCODE -ne 0) { throw "Failed to pack apfs-written-images.tar.gz" }
 
@@ -186,10 +191,12 @@ jobs:
             out=$(hdiutil attach -nobrowse -readonly -mountroot "$mnt" -imagekey diskimage-class=CRawDiskImage "$img")
             DISK=$(awk '$2 == "GUID_partition_scheme" {print $1; exit}' <<<"$out")
             [[ -n "$DISK" ]] || DISK=$(awk 'NR==1{print $1}' <<<"$out")
-            vol_dir=$(find "$mnt" -mindepth 1 -maxdepth 1 -type d | head -n 1)
-            [[ -n "$vol_dir" ]] || { echo "ERROR: Failed to mount $img on macOS"; exit 1; }
-            echo "Mounted $(basename "$vol_dir"):"
-            ls -la "$vol_dir"
+            vol_dirs=$(find "$mnt" -mindepth 1 -maxdepth 1 -type d)
+            [[ -n "$vol_dirs" ]] || { echo "ERROR: Failed to mount $img on macOS"; exit 1; }
+            while IFS= read -r vol_dir; do
+              echo "Mounted $(basename "$vol_dir"):"
+              ls -la "$vol_dir" | head -n 20
+            done <<<"$vol_dirs"
             hdiutil detach -quiet "$DISK"; DISK=""
           done
           echo "All winapfs-written APFS images passed Apple fsck_apfs and mounted cleanly on macOS."

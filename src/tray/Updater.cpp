@@ -275,6 +275,11 @@ bool DownloadUpdateInstaller(const std::string &url, const std::string &asset_na
 		err = "Refusing non-HTTPS update URL";
 		return false;
 	}
+	if (!IsTrustedDownloadUrl(url))
+	{
+		err = "Refusing untrusted update host";
+		return false;
+	}
 
 	std::wstring wurl = ToWide(url);
 	wchar_t host[256] = {};
