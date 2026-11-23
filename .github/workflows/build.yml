@@ -1,0 +1,103 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install WinFsp SDK
+        run: |
+          $msi = Join-Path $env:TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.2/winfsp-2.2.26323.msi' -OutFile $msi
+          $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i', $msi, '/qn', 'ADDLOCAL=ALL'
+          if ($proc.ExitCode -notin 0, 3010) {
+            throw "WinFsp installation failed with exit code $($proc.ExitCode)"
+          }
+          foreach ($required in @(
+            'C:\Program Files (x86)\WinFsp\inc\winfsp\winfsp.h',
+            'C:\Program Files (x86)\WinFsp\lib\winfsp-x64.lib'
+          )) {
+            if (-not (Test-Path $required)) {
+              throw "Missing WinFsp SDK file: $required"
+            }
+          }
+
+      - name: Install WiX Toolset 5
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          if ($LASTEXITCODE -ne 0) { throw "dotnet tool install wix failed ($LASTEXITCODE)" }
+          $dotnetTools = Join-Path $env:USERPROFILE '.dotnet\tools'
+          $dotnetTools | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:PATH = "$dotnetTools;$env:PATH"
+          wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { throw "wix extension add failed ($LASTEXITCODE)" }
+
+      - name: Configure and build Release (x64)
+        run: |
+          cmd /c build.cmd Release
+          if ($LASTEXITCODE -ne 0) { throw "build.cmd Release failed ($LASTEXITCODE)" }
+
+      - name: Run unit tests
+        run: |
+          ctest --test-dir build -C Release -R "^unit\." --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "ctest failed ($LASTEXITCODE)" }
+
+      - name: Build MSI installer
+        run: |
+          powershell -ExecutionPolicy Bypass -File installer\build.ps1
+          if ($LASTEXITCODE -ne 0) { throw "installer\build.ps1 failed ($LASTEXITCODE)" }
+          $msiFiles = Get-ChildItem -Path dist -Filter 'winapfs-*-x64.msi'
+          if (-not $msiFiles) { throw "No MSI file generated in dist\" }
+          $msiFiles | ForEach-Object { Write-Output "Verified MSI: $($_.FullName)" }
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: winapfs-msi-x64
+          path: dist/winapfs-*-x64.msi
+          if-no-files-found: error
+
+      - name: Upload binaries artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: winapfs-binaries-x64
+          path: |
+            build/src/mount/Release/winapfs.exe
+            build/src/mount/Release/winapfs-tray.exe
+            build/src/cli/Release/winapfs-cli.exe
+            build/src/fsck/Release/winapfs-fsck.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $msi = (Get-ChildItem -Path dist -Filter 'winapfs-*-x64.msi' | Select-Object -First 1).FullName
+          if (-not $msi) { throw "Missing MSI artifact for release" }
+          if (gh release view $tag 2>$null) {
+            gh release upload $tag $msi --clobber
+          } else {
+            gh release create $tag $msi --title "winapfs $tag" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw "gh release failed ($LASTEXITCODE)" }
