@@ -70,7 +70,7 @@ jobs:
           if (-not $msiFiles) { throw "No MSI file generated in dist\" }
           $setupFiles = Get-ChildItem -Path dist -Filter 'winapfs-*-x64-setup.exe'
           if (-not $setupFiles) { throw "No setup bundle generated in dist\" }
-          $msiFiles + $setupFiles | ForEach-Object { Write-Output "Verified installer: $($_.FullName)" }
+          @($msiFiles) + @($setupFiles) | ForEach-Object { Write-Output "Verified installer: $($_.FullName)" }
 
       - name: Upload setup bundle artifact
         uses: actions/upload-artifact@v4
