@@ -511,6 +511,7 @@ public:
 		out_lines.clear();
 		std::string path;
 		int part = -1;
+		bool has_rw = false;
 		{
 			std::lock_guard<std::mutex> lock(m_mutex);
 			Disk *d = nullptr;
@@ -519,7 +520,10 @@ public:
 				return "no such volume";
 			for (const auto &m : d->mounts)
 				if (m.fs->Vol().Writable())
+				{
+					has_rw = true;
 					m.fs->Vol().Sync();
+				}
 			path = d->path;
 			part = s->part;
 		}
@@ -549,7 +553,9 @@ public:
 			return "cannot create output pipe";
 		SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
 
-		std::wstring cmd = L"\"" + fsck_path + L"\" -c";
+		std::wstring cmd = L"\"" + fsck_path + L"\"";
+		if (!has_rw)
+			cmd += L" -c";
 		if (part >= 0)
 			cmd += L" --partition " + std::to_wstring(part);
 		cmd += L" \"" + Utf8ToWide(path) + L"\"";
