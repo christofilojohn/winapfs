@@ -53,6 +53,21 @@ using namespace winapfs;
 
 namespace {
 
+void SecureClear(std::string &s)
+{
+	if (!s.empty())
+	{
+		SecureZeroMemory(&s[0], s.size());
+		s.clear();
+	}
+}
+
+struct SecretStringGuard
+{
+	std::string &s;
+	~SecretStringGuard() { SecureClear(s); }
+};
+
 const wchar_t *kServiceName = L"winapfs";
 const wchar_t *kDisplayName = L"winapfs (APFS for Windows)";
 const wchar_t *kDescription = L"Mounts APFS (Mac) disks at drive letters when they are connected.";
@@ -513,6 +528,11 @@ private:
 				d.mounts[i].fs->Stop();
 				Log(2, "unmounted %s (%ls)", d.mounts[i].name.c_str(), mp.c_str());
 				d.mounts.erase(d.mounts.begin() + static_cast<ptrdiff_t>(i));
+				if (d.mounts.empty())
+				{
+					d.containers.clear();
+					d.locks.clear();
+				}
 				return;
 			}
 	}
@@ -528,6 +548,11 @@ private:
 				if (kv.second.state == "mounted")
 					kv.second.tried = false;
 			}
+		if (d.mounts.empty())
+		{
+			d.containers.clear();
+			d.locks.clear();
+		}
 	}
 
 	void Drop(size_t i)
@@ -655,6 +680,7 @@ private:
 		o.allow_disk_writes = m_cfg.Dword(L"", L"AllowDiskWrites", 0) != 0;
 		o.locks = &disk.locks;
 		o.password = password;
+		SecretStringGuard pw_guard{ o.password };
 		std::unique_ptr<Volume> vol;
 		std::string rw_problem;
 		if (rw && !vi.encrypted)
@@ -810,10 +836,14 @@ private:
 
 	void Serve(HANDLE h)
 	{
+		constexpr size_t kMaxRequestBytes = 65536;
 		std::string req;
 		char buf[4096];
 		OVERLAPPED ov = {};
 		ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		if (!ov.hEvent)
+			return;
+		bool too_large = false;
 		for (;;)
 		{
 			DWORD got = 0;
@@ -824,18 +854,36 @@ private:
 				ok = GetOverlappedResult(h, &ov, &got, TRUE);
 				e = ok ? 0 : GetLastError();
 			}
+			if (got > kMaxRequestBytes || req.size() > kMaxRequestBytes - got)
+			{
+				too_large = true;
+				break;
+			}
 			req.append(buf, got);
 			if (ok)
 				break;
 			if (e != ERROR_MORE_DATA)   // the rest of a longer message follows
 			{
+				SecureZeroMemory(buf, sizeof(buf));
+				SecureClear(req);
 				CloseHandle(ov.hEvent);
 				return;
 			}
 		}
-		while (!req.empty() && (req.back() == '\n' || req.back() == '\r'))
-			req.pop_back();
-		std::string resp = Handle(req);
+		SecureZeroMemory(buf, sizeof(buf));
+		std::string resp;
+		if (too_large)
+		{
+			SecureClear(req);
+			resp = "ERR request too large";
+		}
+		else
+		{
+			while (!req.empty() && (req.back() == '\n' || req.back() == '\r'))
+				req.pop_back();
+			resp = Handle(req);
+			SecureClear(req);
+		}
 		DWORD done = 0;
 		if (!WriteFile(h, resp.data(), static_cast<DWORD>(resp.size()), nullptr, &ov) && GetLastError() == ERROR_IO_PENDING)
 			GetOverlappedResult(h, &ov, &done, TRUE);
@@ -865,6 +913,8 @@ private:
 			m_mounter.Scan();
 		else
 			err = "unknown request";
+		for (auto &part : f)
+			SecureClear(part);
 		return out + (err.empty() ? "OK" : "ERR " + err);
 	}
 

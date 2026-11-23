@@ -87,28 +87,46 @@ int kshim_bdev_register(const wchar_t *path, u64 offset, u64 size, bool writable
 		GET_LENGTH_INFORMATION li;
 		DWORD got = 0;
 		OVERLAPPED ov = { 0 };
+		LONGLONG total = 0;
 		if (GetFileSizeEx(h, &sz)) {
-			size = (u64)sz.QuadPart - offset;
+			total = sz.QuadPart;
 		} else {
 			/* a raw disk: ask the device (overlapped handle: wait for the result) */
 			ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-			if (!DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, NULL, 0, &li, sizeof(li), NULL, &ov) &&
-			    GetLastError() != ERROR_IO_PENDING) {
-				CloseHandle(ov.hEvent);
-				CloseHandle(h);
-				return -EINVAL;
-			}
-			if (!GetOverlappedResult(h, &ov, &got, TRUE)) {
-				CloseHandle(ov.hEvent);
+			if (!ov.hEvent ||
+			    (!DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, NULL, 0, &li, sizeof(li), NULL, &ov) &&
+			     GetLastError() != ERROR_IO_PENDING) ||
+			    !GetOverlappedResult(h, &ov, &got, TRUE)) {
+				if (ov.hEvent)
+					CloseHandle(ov.hEvent);
 				CloseHandle(h);
 				return -EINVAL;
 			}
 			CloseHandle(ov.hEvent);
-			size = (u64)li.Length.QuadPart - offset;
+			total = li.Length.QuadPart;
 		}
+		if (total <= 0 || (u64)total <= offset) {
+			CloseHandle(h);
+			return -EINVAL;
+		}
+		size = (u64)total - offset;
 	}
 
 	AcquireSRWLockExclusive(&g_bdev_lock);
+	for (i = 0; i < MAX_BDEVS; i++) {
+		struct kshim_bdev *existing = &g_bdevs[i];
+		if (existing->used && existing->offset == offset && !_wcsicmp(existing->path, path)) {
+			CloseHandle(h);
+			if (writable && !existing->writable) {
+				ReleaseSRWLockExclusive(&g_bdev_lock);
+				return -EBUSY;
+			}
+			existing->regs++;
+			snprintf(name, name_size, "kshim:%d", i);
+			ReleaseSRWLockExclusive(&g_bdev_lock);
+			return 0;
+		}
+	}
 	for (i = 0; i < MAX_BDEVS && g_bdevs[i].used; i++)
 		;
 	if (i == MAX_BDEVS) {
@@ -164,11 +182,12 @@ void kshim_bdev_unregister(const char *name)
 	if (b && b->regs > 0)
 		b->regs--;
 	if (b && b->regs == 0 && b->opens == 0) {
-		if (getenv("KSHIM_IOSTATS"))
+		const char *iostats = getenv("KSHIM_IOSTATS");
+		if (iostats) {
 			fprintf(stderr, "kshim %s: %lld reads (%lld KiB), %lld writes (%lld KiB)\n", name, (long long)g_reads,
 				(long long)g_read_bytes / 1024, (long long)g_writes, (long long)g_write_bytes / 1024);
-		if (getenv("KSHIM_IOSTATS"))
 			fprintf(stderr, "kshim %s: readahead saw %lld extent pieces\n", name, (long long)g_ra_pieces);
+		}
 		/* nothing dirty should be left after the last close; never drop it silently */
 		if (b->writable)
 			sync_blockdev(&b->bdev);
@@ -184,6 +203,42 @@ struct kshim_bdev *kshim_bdev_of(struct block_device *bdev)
 	return bdev->kshim_dev;
 }
 
+static INIT_ONCE g_fls_once = INIT_ONCE_STATIC_INIT;
+static DWORD g_event_fls = FLS_OUT_OF_INDEXES;
+
+static VOID WINAPI kshim_fls_close_event(PVOID data)
+{
+	if (data)
+		CloseHandle((HANDLE)data);
+}
+
+static BOOL CALLBACK kshim_init_event_fls(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+	(void)once;
+	(void)param;
+	(void)ctx;
+	g_event_fls = FlsAlloc(kshim_fls_close_event);
+	return g_event_fls != FLS_OUT_OF_INDEXES;
+}
+
+static HANDLE kshim_thread_event(void)
+{
+	HANDLE ev;
+	if (!InitOnceExecuteOnce(&g_fls_once, kshim_init_event_fls, NULL, NULL))
+		return NULL;
+	ev = (HANDLE)FlsGetValue(g_event_fls);
+	if (!ev) {
+		ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+		if (!ev)
+			return NULL;
+		if (!FlsSetValue(g_event_fls, ev)) {
+			CloseHandle(ev);
+			return NULL;
+		}
+	}
+	return ev;
+}
+
 static int io(struct block_device *bdev, bool write, u64 off, void *buf, size_t len)
 {
 	struct kshim_bdev *b = bdev->kshim_dev;
@@ -197,10 +252,8 @@ static int io(struct block_device *bdev, bool write, u64 off, void *buf, size_t 
 	InterlockedIncrement64(write ? &g_writes : &g_reads);
 	InterlockedAdd64(write ? &g_write_bytes : &g_read_bytes, (LONG64)len);
 
-	/* one event per thread (ReadFile/WriteFile reset it when the I/O starts) */
-	static __declspec(thread) HANDLE t_event;
-	if (!t_event)
-		t_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+	/* one FLS event per thread, closed automatically when the thread exits */
+	HANDLE t_event = kshim_thread_event();
 	if (!t_event)
 		return -ENOMEM;
 
@@ -440,11 +493,13 @@ void fput(struct file *f)
 
 int lookup_bdev(const char *path, dev_t *dev)
 {
-	struct kshim_bdev *b = lookup(path);
-	if (!b)
-		return -ENODEV;
-	*dev = b->bdev.bd_dev;
-	return 0;
+	struct kshim_bdev *b;
+	AcquireSRWLockShared(&g_bdev_lock);
+	b = lookup(path);
+	if (b)
+		*dev = b->bdev.bd_dev;
+	ReleaseSRWLockShared(&g_bdev_lock);
+	return b ? 0 : -ENODEV;
 }
 
 int set_blocksize(struct file *f, int size)
@@ -501,8 +556,14 @@ void free_anon_bdev(dev_t d)
 struct block_device *kshim_bdev_by_mapping(struct address_space *m)
 {
 	int i;
-	for (i = 0; i < MAX_BDEVS; i++)
-		if (g_bdevs[i].used && &g_bdevs[i].mapping == m)
-			return &g_bdevs[i].bdev;
-	return NULL;
+	struct block_device *res = NULL;
+	AcquireSRWLockShared(&g_bdev_lock);
+	for (i = 0; i < MAX_BDEVS; i++) {
+		if (g_bdevs[i].used && &g_bdevs[i].mapping == m) {
+			res = &g_bdevs[i].bdev;
+			break;
+		}
+	}
+	ReleaseSRWLockShared(&g_bdev_lock);
+	return res;
 }

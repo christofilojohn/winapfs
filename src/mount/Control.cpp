@@ -8,6 +8,21 @@
 
 namespace winapfs {
 
+static void SecureClear(std::string &s)
+{
+	if (!s.empty())
+	{
+		SecureZeroMemory(&s[0], s.size());
+		s.clear();
+	}
+}
+
+struct SecretStringGuard
+{
+	std::string &s;
+	~SecretStringGuard() { SecureClear(s); }
+};
+
 const wchar_t *const kServicePipe = L"\\\\.\\pipe\\winapfs";
 const wchar_t *const kDebugPipe = L"\\\\.\\pipe\\winapfs-debug";
 
@@ -69,6 +84,7 @@ int ControlRequest(const std::wstring &pipe, const std::string &request, std::ve
 	SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
 	DWORD done = 0;
 	std::string req = request + "\n";
+	SecretStringGuard req_guard{ req };
 	if (!WriteFile(h, req.data(), static_cast<DWORD>(req.size()), &done, nullptr))
 	{
 		err = "cannot send the request (error " + std::to_string(GetLastError()) + ")";

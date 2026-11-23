@@ -22,10 +22,12 @@
 #include <shellapi.h>
 #include <shlobj.h>
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace winapfs;
@@ -34,6 +36,7 @@ namespace {
 
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT WM_ACTION_DONE = WM_APP + 2;   // lParam: new std::wstring (message) or null
+constexpr UINT WM_POLL_DONE = WM_APP + 3;     // lParam: new PollUiUpdate
 constexpr UINT_PTR TIMER_POLL = 1;
 constexpr UINT kPollMs = 2500;
 
@@ -72,6 +75,15 @@ bool g_service_up = false;
 std::map<std::string, std::string> g_seen;   // uuid -> "state|letter|mode" at the last poll
 bool g_first_poll = true;
 std::string g_balloon_uuid;            // a locked volume the last notification was about
+std::atomic<bool> g_polling{ false };
+std::atomic<bool> g_exiting{ false };
+
+struct PollUiUpdate
+{
+	std::wstring tip;
+	std::wstring notify_title;
+	std::wstring notify_text;
+};
 
 std::wstring W(const std::string &s)
 {
@@ -138,77 +150,94 @@ std::wstring StateText(const VolumeStatus &v)
 
 // ---------------------------------------------------------------- polling
 
-void Poll()
+void StartPollAsync()
 {
-	std::vector<VolumeStatus> vols;
-	bool allow = false;
-	std::string err;
-	bool up = ControlList(g_pipe, vols, allow, err);
+	if (g_exiting.load() || g_polling.exchange(true))
+		return;
+	std::thread([] {
+		std::vector<VolumeStatus> vols;
+		bool allow = false;
+		std::string err;
+		bool up = ControlList(g_pipe, vols, allow, err);
 
-	std::vector<std::pair<std::wstring, std::wstring>> notes;   // title, text
-	std::string locked_uuid;
-	{
-		std::lock_guard<std::mutex> lock(g_mutex);
-		if (!g_first_poll && up)
-			for (const auto &v : vols)
-			{
-				std::string now = v.state + "|" + v.letter + "|" + v.mode;
-				auto it = g_seen.find(v.uuid);
-				std::string before = it == g_seen.end() ? "" : it->second;
-				if (before == now)
-					continue;
-				if (v.state == "mounted")
-					notes.emplace_back(W(v.name) + L" is ready", L"Mounted at " + W(v.letter) + L" (" + StateText(v) + L")");
-				else if (v.state == "locked" && before.compare(0, 6, "locked") != 0)
-				{
-					notes.emplace_back(W(v.name) + L" is encrypted", L"Click here to unlock it with its password.");
-					locked_uuid = v.uuid;
-				}
-				else if (before.compare(0, 7, "mounted") == 0)
-					notes.emplace_back(W(v.name) + L" unmounted", v.note.empty() ? L"It is no longer mounted." : W(v.note));
-			}
-		if (up && !g_first_poll)
-			for (const auto &kv : g_seen)
-			{
-				bool still = false;
+		std::vector<std::pair<std::wstring, std::wstring>> notes;   // title, text
+		std::string locked_uuid;
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			if (!g_first_poll && up)
 				for (const auto &v : vols)
-					still = still || v.uuid == kv.first;
-				if (!still && kv.second.compare(0, 7, "mounted") == 0)
-					notes.emplace_back(L"APFS disk removed", L"Its volumes were unmounted.");
-			}
-		g_seen.clear();
-		for (const auto &v : vols)
-			g_seen[v.uuid] = v.state + "|" + v.letter + "|" + v.mode;
-		if (!locked_uuid.empty())
-			g_balloon_uuid = locked_uuid;
-		g_first_poll = !up;
-		g_vols = vols;
-		g_allow_writes = allow;
-		g_service_up = up;
-	}
+				{
+					std::string now = v.state + "|" + v.letter + "|" + v.mode;
+					auto it = g_seen.find(v.uuid);
+					std::string before = it == g_seen.end() ? "" : it->second;
+					if (before == now)
+						continue;
+					if (v.state == "mounted")
+						notes.emplace_back(W(v.name) + L" is ready", L"Mounted at " + W(v.letter) + L" (" + StateText(v) + L")");
+					else if (v.state == "locked" && before.compare(0, 6, "locked") != 0)
+					{
+						notes.emplace_back(W(v.name) + L" is encrypted", L"Click here to unlock it with its password.");
+						locked_uuid = v.uuid;
+					}
+					else if (before.compare(0, 7, "mounted") == 0)
+						notes.emplace_back(W(v.name) + L" unmounted", v.note.empty() ? L"It is no longer mounted." : W(v.note));
+				}
+			if (up && !g_first_poll)
+				for (const auto &kv : g_seen)
+				{
+					bool still = false;
+					for (const auto &v : vols)
+						still = still || v.uuid == kv.first;
+					if (!still && kv.second.compare(0, 7, "mounted") == 0)
+						notes.emplace_back(L"APFS disk removed", L"Its volumes were unmounted.");
+				}
+			g_seen.clear();
+			for (const auto &v : vols)
+				g_seen[v.uuid] = v.state + "|" + v.letter + "|" + v.mode;
+			if (!locked_uuid.empty())
+				g_balloon_uuid = locked_uuid;
+			g_first_poll = !up;
+			g_vols = vols;
+			g_allow_writes = allow;
+			g_service_up = up;
+		}
 
-	size_t mounted = 0;
-	for (const auto &v : vols)
-		mounted += v.state == "mounted";
-	if (!up)
-		SetTip(L"winapfs: the service is not running");
-	else if (vols.empty())
-		SetTip(L"winapfs: no APFS disks");
-	else
-		SetTip(L"winapfs: " + std::to_wstring(mounted) + L" of " + std::to_wstring(vols.size()) + L" APFS volumes mounted");
-	if (!notes.empty())
-		Notify(notes.back().first, notes.size() == 1 ? notes.back().second : notes.back().second + L" (and more)");
+		size_t mounted = 0;
+		for (const auto &v : vols)
+			mounted += v.state == "mounted";
+		auto *upd = new PollUiUpdate;
+		if (!up)
+			upd->tip = L"winapfs: the service is not running";
+		else if (vols.empty())
+			upd->tip = L"winapfs: no APFS disks";
+		else
+			upd->tip = L"winapfs: " + std::to_wstring(mounted) + L" of " + std::to_wstring(vols.size()) + L" APFS volumes mounted";
+		if (!notes.empty())
+		{
+			upd->notify_title = notes.back().first;
+			upd->notify_text = notes.size() == 1 ? notes.back().second : notes.back().second + L" (and more)";
+		}
+		g_polling.store(false);
+		if (g_exiting.load() || !PostMessageW(g_wnd, WM_POLL_DONE, 0, reinterpret_cast<LPARAM>(upd)))
+			delete upd;
+	}).detach();
 }
 
 // Runs a request off the UI thread; failures come back as a notification.
-void Request(const std::string &req, const std::wstring &what)
+void Request(std::string req, const std::wstring &what)
 {
-	std::thread([req, what] {
+	std::thread([req = std::move(req), what]() mutable {
 		std::vector<std::string> lines;
 		std::string err;
 		int rc = ControlRequest(g_pipe, req, lines, err);
+		if (!req.empty())
+		{
+			SecureZeroMemory(&req[0], req.size());
+			req.clear();
+		}
 		std::wstring *msg = rc ? new std::wstring(what + L": " + W(err)) : nullptr;
-		PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg));
+		if (!PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
+			delete msg;
 	}).detach();
 }
 
@@ -301,8 +330,14 @@ void Unlock(const VolumeStatus &v)
 		return;
 	std::string pw = U(d.password);
 	SecureZeroMemory(&d.password[0], d.password.size() * sizeof(wchar_t));
-	Request("mount\t" + v.uuid + "\t" + pw, L"Cannot unlock " + d.name);
-	SecureZeroMemory(&pw[0], pw.size());
+	d.password.clear();
+	std::string req = "mount\t" + v.uuid + "\t" + pw;
+	if (!pw.empty())
+	{
+		SecureZeroMemory(&pw[0], pw.size());
+		pw.clear();
+	}
+	Request(std::move(req), L"Cannot unlock " + d.name);
 }
 
 // ---------------------------------------------------------------- menu
@@ -328,7 +363,7 @@ void About()
 
 void ShowMenu()
 {
-	Poll();
+	StartPollAsync();
 	std::vector<VolumeStatus> vols;
 	bool allow, up;
 	{
@@ -511,8 +546,20 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 		return 0;
 	case WM_TIMER:
 		if (wp == TIMER_POLL)
-			Poll();
+			StartPollAsync();
 		return 0;
+	case WM_POLL_DONE:
+	{
+		auto *upd = reinterpret_cast<PollUiUpdate *>(lp);
+		if (upd)
+		{
+			SetTip(upd->tip);
+			if (!upd->notify_title.empty())
+				Notify(upd->notify_title, upd->notify_text);
+			delete upd;
+		}
+		return 0;
+	}
 	case WM_ACTION_DONE:
 	{
 		auto *m = reinterpret_cast<std::wstring *>(lp);
@@ -521,10 +568,11 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 			Notify(L"winapfs", *m, NIIF_WARNING);
 			delete m;
 		}
-		Poll();
+		StartPollAsync();
 		return 0;
 	}
 	case WM_DESTROY:
+		g_exiting.store(true);
 		KillTimer(wnd, TIMER_POLL);
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
 		PostQuitMessage(0);
@@ -576,7 +624,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 	wcscpy_s(g_nid.szTip, L"winapfs");
 	AddIcon();
 
-	Poll();
+	StartPollAsync();
 	SetTimer(g_wnd, TIMER_POLL, kPollMs, nullptr);
 
 	MSG msg;
