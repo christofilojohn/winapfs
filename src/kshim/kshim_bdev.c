@@ -206,7 +206,11 @@ struct kshim_bdev *kshim_bdev_of(struct block_device *bdev)
 
 bool kshim_bdev_io_failed(struct block_device *bdev)
 {
-	return bdev && bdev->kshim_dev && InterlockedCompareExchange(&bdev->kshim_dev->io_failed, 0, 0) != 0;
+	struct kshim_bdev *b;
+	if (!bdev || !bdev->kshim_dev)
+		return false;
+	b = bdev->kshim_dev;
+	return InterlockedCompareExchange(&b->io_failed, 0, 0) != 0;
 }
 
 static INIT_ONCE g_fls_once = INIT_ONCE_STATIC_INIT;
