@@ -623,16 +623,24 @@ void ActionUnlock(VolumeStatus v)
 	std::string req = "mount\t" + v.uuid + "\t" + pw;
 	SecureClearString(pw);
 	bool remember = d.remember;
+	bool had_saved = d.has_saved;
 	std::wstring vname = d.name;
-	std::thread([req = std::move(req), v, remember, wpw = std::move(wpw_copy), vname]() mutable {
+	std::thread([req = std::move(req), v, remember, had_saved, wpw = std::move(wpw_copy), vname]() mutable {
 		std::vector<std::string> lines;
 		std::string err;
 		int rc = ControlRequest(g_pipe, req, lines, err);
 		SecureClearString(req);
-		if (rc == 0 && remember && !wpw.empty())
+		if (rc == 0)
 		{
-			if (!SaveVolumePassword(v.uuid, v.name, wpw))
-				err = "unlocked, but could not save password in Windows Credential Manager";
+			if (remember && !wpw.empty())
+			{
+				if (!SaveVolumePassword(v.uuid, v.name, wpw))
+					err = "unlocked, but could not save password in Windows Credential Manager";
+			}
+			else if (!remember && had_saved)
+			{
+				DeleteVolumePassword(v.uuid);
+			}
 		}
 		SecureClearWString(wpw);
 		std::wstring *msg = nullptr;
@@ -640,7 +648,7 @@ void ActionUnlock(VolumeStatus v)
 			msg = new std::wstring(L"Cannot unlock " + vname + L": " + W(err));
 		else if (!err.empty())
 			msg = new std::wstring(W(err));
-		if (!PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
+		if (g_exiting.load() || !PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
 			delete msg;
 	}).detach();
 }

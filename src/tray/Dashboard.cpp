@@ -57,8 +57,10 @@ enum class BtnTone
 struct HitButton
 {
 	Gdiplus::RectF rect;
+	Gdiplus::RectF hit_rect;
 	BtnKind kind;
 	int vol_index = -1;
+	std::string vol_uuid;
 	BtnTone tone = BtnTone::Neutral;
 	std::wstring text;
 	bool enabled = true;
@@ -112,7 +114,9 @@ bool g_dark = false;
 int g_scroll_y = 0;
 int g_max_scroll = 0;
 int g_hover_btn = -1;
-int g_press_btn = -1;
+bool g_has_press = false;
+BtnKind g_press_kind = BtnKind::About;
+std::string g_press_uuid;
 int g_hover_card = -1;
 bool g_tracking_mouse = false;
 std::vector<HitButton> g_buttons;
@@ -292,10 +296,17 @@ float MeasureTextWidth(Gdiplus::Graphics &g, const std::wstring &text, const Gdi
 	return box.Width;
 }
 
+Gdiplus::RectF ClipRectY(const Gdiplus::RectF &r, float top, float bot)
+{
+	float y0 = (std::max)(r.Y, top);
+	float y1 = (std::min)(r.Y + r.Height, bot);
+	return y1 > y0 ? Gdiplus::RectF(r.X, y0, r.Width, y1 - y0) : Gdiplus::RectF(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
 void DrawButton(Gdiplus::Graphics &g, const HitButton &b, int idx, float s, const Palette &pal, const Gdiplus::Font &font)
 {
 	bool hover = (idx == g_hover_btn) && b.enabled;
-	bool press = (idx == g_press_btn) && b.enabled;
+	bool press = g_has_press && b.enabled && b.kind == g_press_kind && b.vol_uuid == g_press_uuid;
 	Gdiplus::Color bg = pal.btn_bg;
 	Gdiplus::Color fg = pal.text_primary;
 	Gdiplus::Color border = pal.btn_border;
@@ -452,6 +463,7 @@ void PaintWindow(HWND hwnd)
 					brx -= bw;
 					HitButton hb;
 					hb.rect = Gdiplus::RectF(brx, bby, bw, bbh);
+					hb.hit_rect = ClipRectY(hb.rect, content_top, content_bot);
 					hb.kind = kind;
 					hb.tone = tone;
 					hb.text = label;
@@ -505,6 +517,7 @@ void PaintWindow(HWND hwnd)
 			float bh = 32.0f * s;
 			HitButton cta;
 			cta.rect = Gdiplus::RectF(box.X + (box.Width - bw) * 0.5f, box.Y + 110.0f * s, bw, bh);
+			cta.hit_rect = ClipRectY(cta.rect, content_top, content_bot);
 			cta.tone = BtnTone::Primary;
 			if (g_state.service_up)
 			{
@@ -537,7 +550,7 @@ void PaintWindow(HWND hwnd)
 				float card_h = 148.0f * s + (v.has_space ? 26.0f * s : 0.0f) + (has_note ? 20.0f * s : 0.0f);
 
 				Gdiplus::RectF card(pad_x, y, card_w, card_h);
-				g_card_rects.push_back(card);
+				g_card_rects.push_back(ClipRectY(card, content_top, content_bot));
 
 				if (card.Y + card.Height >= content_top && card.Y <= content_bot)
 				{
@@ -689,8 +702,10 @@ void PaintWindow(HWND hwnd)
 						float bw = MeasureTextWidth(g, label, font) + pad * s;
 						HitButton hb;
 						hb.rect = Gdiplus::RectF(bx, by, bw, row_h);
+						hb.hit_rect = ClipRectY(hb.rect, content_top, content_bot);
 						hb.kind = kind;
 						hb.vol_index = static_cast<int>(i);
+						hb.vol_uuid = v.uuid;
 						hb.tone = tone;
 						hb.text = label;
 						hb.enabled = enabled;
@@ -793,6 +808,7 @@ void PaintWindow(HWND hwnd)
 				rx -= bw;
 				HitButton hb;
 				hb.rect = Gdiplus::RectF(rx, by, bw, bh);
+				hb.hit_rect = hb.rect;
 				hb.kind = kind;
 				hb.tone = tone;
 				hb.text = label;
@@ -868,7 +884,8 @@ int HitTestButton(int x, int y)
 	float fy = static_cast<float>(y);
 	for (int i = static_cast<int>(g_buttons.size()) - 1; i >= 0; i--)
 	{
-		if (g_buttons[static_cast<size_t>(i)].enabled && g_buttons[static_cast<size_t>(i)].rect.Contains(fx, fy))
+		const HitButton &b = g_buttons[static_cast<size_t>(i)];
+		if (b.enabled && b.hit_rect.Width > 0.0f && b.hit_rect.Height > 0.0f && b.hit_rect.Contains(fx, fy))
 			return i;
 	}
 	return -1;
@@ -880,7 +897,8 @@ int HitTestCard(int x, int y)
 	float fy = static_cast<float>(y);
 	for (size_t i = 0; i < g_card_rects.size(); i++)
 	{
-		if (g_card_rects[i].Contains(fx, fy))
+		const Gdiplus::RectF &r = g_card_rects[i];
+		if (r.Width > 0.0f && r.Height > 0.0f && r.Contains(fx, fy))
 			return static_cast<int>(i);
 	}
 	return -1;
@@ -1034,11 +1052,12 @@ LRESULT CALLBACK DashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 	case WM_MOUSELEAVE:
 		g_tracking_mouse = false;
-		if (g_hover_btn != -1 || g_hover_card != -1 || g_press_btn != -1)
+		if (g_hover_btn != -1 || g_hover_card != -1 || g_has_press)
 		{
 			g_hover_btn = -1;
 			g_hover_card = -1;
-			g_press_btn = -1;
+			g_has_press = false;
+			g_press_uuid.clear();
 			InvalidateRect(hwnd, nullptr, FALSE);
 		}
 		return 0;
@@ -1058,7 +1077,10 @@ LRESULT CALLBACK DashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		int hb = HitTestButton(x, y);
 		if (hb != -1)
 		{
-			g_press_btn = hb;
+			const HitButton &b = g_buttons[static_cast<size_t>(hb)];
+			g_has_press = true;
+			g_press_kind = b.kind;
+			g_press_uuid = b.vol_uuid;
 			SetCapture(hwnd);
 			InvalidateRect(hwnd, nullptr, FALSE);
 		}
@@ -1070,13 +1092,20 @@ LRESULT CALLBACK DashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		int x = GET_X_LPARAM(lp);
 		int y = GET_Y_LPARAM(lp);
 		int hb = HitTestButton(x, y);
-		int pressed = g_press_btn;
-		g_press_btn = -1;
+		bool was_pressed = g_has_press;
+		BtnKind press_kind = g_press_kind;
+		std::string press_uuid = std::move(g_press_uuid);
+		g_has_press = false;
+		g_press_uuid.clear();
 		if (GetCapture() == hwnd)
 			ReleaseCapture();
 		InvalidateRect(hwnd, nullptr, FALSE);
-		if (pressed != -1 && pressed == hb && static_cast<size_t>(pressed) < g_buttons.size())
-			TriggerButton(g_buttons[static_cast<size_t>(pressed)]);
+		if (was_pressed && hb != -1 && static_cast<size_t>(hb) < g_buttons.size())
+		{
+			const HitButton &b = g_buttons[static_cast<size_t>(hb)];
+			if (b.kind == press_kind && b.vol_uuid == press_uuid)
+				TriggerButton(b);
+		}
 		return 0;
 	}
 

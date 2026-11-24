@@ -42,6 +42,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <condition_variable>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -444,14 +445,18 @@ public:
 				if (!s)
 					return "no such volume";
 				std::wstring cur_mp;
+				bool encrypted = false;
 				for (const auto &m : d->mounts)
 					if (m.uuid == uuid)
+					{
 						cur_mp = m.fs->MountPoint();
+						encrypted = m.fs->Vol().Info().encrypted;
+					}
 				if (_wcsicmp(cur_mp.c_str(), wval.c_str()) != 0 && !LetterFree(letter))
 					return "drive letter is already in use";
 				if (!m_cfg.SetString(VolKey(uuid), L"DriveLetter", wval))
 					return "cannot store the setting";
-				if (!cur_mp.empty() && _wcsicmp(cur_mp.c_str(), wval.c_str()) != 0)
+				if (!cur_mp.empty() && !encrypted && _wcsicmp(cur_mp.c_str(), wval.c_str()) != 0)
 				{
 					Stop(*d, uuid);
 					s->tried = false;
@@ -476,6 +481,10 @@ public:
 			if (!m_cfg.SetDword(VolKey(uuid), wkey.c_str(), value == "1"))
 				return "cannot store the setting";
 			bool mounted = IsMounted(*d, uuid);
+			bool encrypted = false;
+			for (const auto &m : d->mounts)
+				if (m.uuid == uuid)
+					encrypted = m.fs->Vol().Info().encrypted;
 			if (key == "Disabled" && value == "1")
 			{
 				Stop(*d, uuid);
@@ -494,7 +503,7 @@ public:
 				StopPartition(*d, s->part);
 				remount = true;
 			}
-			else if (mounted)
+			else if (mounted && !encrypted)
 			{
 				Stop(*d, uuid);     // applies HideDotfiles
 				s->tried = false;
@@ -540,9 +549,12 @@ public:
 		std::wstring fsck_path = exe_dir + L"winapfs-fsck.exe";
 		if (GetFileAttributesW(fsck_path.c_str()) == INVALID_FILE_ATTRIBUTES)
 		{
-			std::wstring alt = exe_dir + L"..\\..\\fsck\\Release\\winapfs-fsck.exe";
-			if (GetFileAttributesW(alt.c_str()) != INVALID_FILE_ATTRIBUTES)
-				fsck_path = alt;
+			std::wstring alt_rel = exe_dir + L"..\\..\\fsck\\Release\\winapfs-fsck.exe";
+			std::wstring alt_dbg = exe_dir + L"..\\..\\fsck\\Debug\\winapfs-fsck.exe";
+			if (GetFileAttributesW(alt_rel.c_str()) != INVALID_FILE_ATTRIBUTES)
+				fsck_path = alt_rel;
+			else if (GetFileAttributesW(alt_dbg.c_str()) != INVALID_FILE_ATTRIBUTES)
+				fsck_path = alt_dbg;
 			else
 				return "winapfs-fsck.exe not found";
 		}
@@ -576,30 +588,35 @@ public:
 		}
 
 		std::string captured;
-		char buf[1024];
-		DWORD got = 0;
-		while (ReadFile(rd, buf, sizeof(buf), &got, nullptr) && got > 0)
-		{
-			if (captured.size() < 16384)
+		std::thread reader([rd, &captured] {
+			char buf[1024];
+			DWORD got = 0;
+			while (ReadFile(rd, buf, sizeof(buf), &got, nullptr) && got > 0)
 			{
-				size_t take = (std::min)(static_cast<size_t>(got), 16384 - captured.size());
-				captured.append(buf, take);
+				if (captured.size() < 16384)
+				{
+					size_t take = (std::min)(static_cast<size_t>(got), 16384 - captured.size());
+					captured.append(buf, take);
+				}
 			}
-		}
-		CloseHandle(rd);
+			CloseHandle(rd);
+		});
 
 		DWORD wait_rc = WaitForSingleObject(pi.hProcess, 60000);
 		DWORD exit_code = 1;
 		if (wait_rc != WAIT_OBJECT_0)
 		{
 			TerminateProcess(pi.hProcess, 1);
+			WaitForSingleObject(pi.hProcess, 5000);
 			CloseHandle(pi.hThread);
 			CloseHandle(pi.hProcess);
+			reader.join();
 			return "winapfs-fsck timed out";
 		}
 		GetExitCodeProcess(pi.hProcess, &exit_code);
 		CloseHandle(pi.hThread);
 		CloseHandle(pi.hProcess);
+		reader.join();
 
 		out_lines = "exit\t" + std::to_string(exit_code) + "\n";
 		size_t pos = 0;
@@ -941,6 +958,8 @@ public:
 		SetEvent(m_stop);
 		if (m_thread.joinable())
 			m_thread.join();
+		std::unique_lock<std::mutex> lock(m_workers_mutex);
+		m_workers_cv.wait(lock, [this] { return m_active_workers == 0; });
 		CloseHandle(m_stop);
 		if (m_sd)
 			LocalFree(m_sd);
@@ -982,9 +1001,25 @@ private:
 			CloseHandle(ov.hEvent);
 			HANDLE next = connected ? NewInstance() : INVALID_HANDLE_VALUE;
 			if (connected)
-				Serve(h);
-			DisconnectNamedPipe(h);
-			CloseHandle(h);
+			{
+				{
+					std::lock_guard<std::mutex> lock(m_workers_mutex);
+					m_active_workers++;
+				}
+				std::thread([this, h] {
+					Serve(h);
+					DisconnectNamedPipe(h);
+					CloseHandle(h);
+					std::lock_guard<std::mutex> lock(m_workers_mutex);
+					if (--m_active_workers == 0)
+						m_workers_cv.notify_all();
+				}).detach();
+			}
+			else
+			{
+				DisconnectNamedPipe(h);
+				CloseHandle(h);
+			}
 			h = next;
 		}
 		if (h != INVALID_HANDLE_VALUE)
@@ -1082,6 +1117,9 @@ private:
 	PSECURITY_DESCRIPTOR m_sd = nullptr;
 	HANDLE m_stop = nullptr;
 	std::thread m_thread;
+	std::mutex m_workers_mutex;
+	std::condition_variable m_workers_cv;
+	int m_active_workers = 0;
 };
 
 // interactive users may use the pipe; SYSTEM and administrators fully
@@ -1557,8 +1595,29 @@ int CmdCtl(const std::vector<std::wstring> &args)
 	}
 	std::string want = WideToUtf8(args[1]), uuid;
 	for (const auto &v : vols)
-		if (v.uuid == want || v.name == want)
+	{
+		if (v.uuid == want)
+		{
 			uuid = v.uuid;
+			break;
+		}
+	}
+	if (uuid.empty())
+	{
+		std::vector<const VolumeStatus *> matches;
+		for (const auto &v : vols)
+			if (v.name == want)
+				matches.push_back(&v);
+		if (matches.size() == 1)
+			uuid = matches[0]->uuid;
+		else if (matches.size() > 1)
+		{
+			fprintf(stderr, "multiple volumes named '%s'; specify its UUID:\n", want.c_str());
+			for (const VolumeStatus *v : matches)
+				fprintf(stderr, "  %s  (%s)\n", v->uuid.c_str(), v->disk.c_str());
+			return 1;
+		}
+	}
 	if (uuid.empty())
 	{
 		fprintf(stderr, "no volume '%s' (see winapfs ctl list)\n", want.c_str());
