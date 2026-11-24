@@ -31,6 +31,7 @@ struct kshim_bdev {
 	u64 offset;
 	u64 size;
 	bool writable;
+	volatile LONG io_failed; /* latched fatal write/flush error */
 	struct block_device bdev;
 	struct gendisk disk;
 	struct backing_dev_info bdi;
@@ -246,6 +247,8 @@ static int io(struct block_device *bdev, bool write, u64 off, void *buf, size_t 
 
 	if (write && !b->writable)
 		return -EROFS;
+	if (write && InterlockedCompareExchange(&b->io_failed, 0, 0) != 0)
+		return -EIO;
 	if (off > b->size || len > b->size - off)
 		return -EIO;
 	off += b->offset;
@@ -266,11 +269,19 @@ static int io(struct block_device *bdev, bool write, u64 off, void *buf, size_t 
 		ov.OffsetHigh = (DWORD)(off >> 32);
 		ov.hEvent = t_event;
 		ok = write ? WriteFile(b->h, p, chunk, NULL, &ov) : ReadFile(b->h, p, chunk, NULL, &ov);
-		if (!ok && GetLastError() != ERROR_IO_PENDING)
+		if (!ok && GetLastError() != ERROR_IO_PENDING) {
+			DWORD we = GetLastError();
+			if (write && InterlockedExchange(&b->io_failed, 1) == 0)
+				pr_err("kshim %s: write I/O error (win32 %lu), blocking further writes\n", b->bdev.bd_name, (unsigned long)we);
 			return -EIO;
+		}
 		ok = GetOverlappedResult(b->h, &ov, &done, TRUE);
-		if (!ok || done != chunk)
+		if (!ok || done != chunk) {
+			DWORD we = GetLastError();
+			if (write && InterlockedExchange(&b->io_failed, 1) == 0)
+				pr_err("kshim %s: write I/O error (win32 %lu), blocking further writes\n", b->bdev.bd_name, (unsigned long)we);
 			return -EIO;
+		}
 		p += chunk;
 		off += chunk;
 		len -= chunk;
@@ -428,13 +439,23 @@ int kshim_bdev_flush(struct block_device *bdev)
 	struct kshim_bdev *b = bdev->kshim_dev;
 	if (!b->writable)
 		return 0;
+	if (InterlockedCompareExchange(&b->io_failed, 0, 0) != 0)
+		return -EIO;
 	kshim_unplug();   /* queued writes belong before the barrier */
+	if (InterlockedCompareExchange(&b->io_failed, 0, 0) != 0)
+		return -EIO;
 	if (g_crash.how == CRASH_POWER) {
 		AcquireSRWLockExclusive(&g_crash.lock);
 		crash_apply(bdev, false);
 		ReleaseSRWLockExclusive(&g_crash.lock);
 	}
-	return FlushFileBuffers(b->h) ? 0 : -EIO;
+	if (!FlushFileBuffers(b->h)) {
+		DWORD we = GetLastError();
+		if (InterlockedExchange(&b->io_failed, 1) == 0)
+			pr_err("kshim %s: flush barrier failed (win32 %lu), blocking further writes\n", b->bdev.bd_name, (unsigned long)we);
+		return -EIO;
+	}
+	return 0;
 }
 
 /* ------------------------------------------------------------ Linux API */

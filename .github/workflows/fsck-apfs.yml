@@ -85,7 +85,7 @@ jobs:
           $stages = @(
             '^(unit|image|cli|mount\.|mount_all|rawdev|mount_rawdev|rwengine|mount_case|mount_lib|mount_dotfiles|fsck)',
             '^(write\.|write_fsck|mountwrite)',
-            '^(crash|diskfull|prealloc|dirquery)',
+            '^(crash|diskfull|prealloc|dirquery|concurrent)',
             '^w5_',
             '^service\.',
             '^(pagecache|inodecache)'
@@ -114,7 +114,12 @@ jobs:
               }
               Remove-Item 'build\tests\w3-*.img', 'build\tests\w32-*.img' -Force -ErrorAction SilentlyContinue
             },
-            { Remove-Item 'build\tests\crash-*.img*', 'build\tests\full-*.img*', 'build\tests\prealloc-*.img', 'build\tests\dirquery-*.img' -Force -ErrorAction SilentlyContinue },
+            {
+              $conc = 'build\tests\conc-compressed.img'
+              if (-not (Test-Path $conc)) { throw "Missing $conc" }
+              Move-Item $conc 'out\conc-compressed.written.img' -Force
+              Remove-Item 'build\tests\crash-*.img*', 'build\tests\full-*.img*', 'build\tests\prealloc-*.img', 'build\tests\dirquery-*.img' -Force -ErrorAction SilentlyContinue
+            },
             {
               $mv = 'build\tests\w5-multivol.img'
               if (-not (Test-Path $mv)) { throw "Missing $mv" }

@@ -327,6 +327,21 @@ if(TARGET winapfs)
 				-Image ${TD}/${img} -Work ${CMAKE_CURRENT_BINARY_DIR}/dirquery-${img} -Volume ${vol} ${cs})
 		set_tests_properties(dirquery.${img} PROPERTIES RESOURCE_LOCK winfsp_mount)
 	endforeach()
+
+	# multi-threaded Win32 concurrent write stress test (churn, compressed overwrite, ADS, queries)
+	add_executable(winapfs-concurrent-test concurrent_write_test.cpp)
+	target_compile_options(winapfs-concurrent-test PRIVATE /W4)
+	target_link_options(winapfs-concurrent-test PRIVATE /ENTRY:wmainCRTStartup)
+	set(conc_img ${CMAKE_CURRENT_BINARY_DIR}/conc-compressed.img)
+	add_test(NAME concurrent_prepare.compressed.img COMMAND ${CMAKE_COMMAND} -E copy ${TD}/compressed.img ${conc_img})
+	set_tests_properties(concurrent_prepare.compressed.img PROPERTIES FIXTURES_SETUP conc-prep)
+	add_test(NAME concurrent.compressed.img
+		COMMAND winapfs mount ${conc_img} * --rw
+			--run "\"$<TARGET_FILE:winapfs-concurrent-test>\" %MOUNT%")
+	set_tests_properties(concurrent.compressed.img PROPERTIES
+		RESOURCE_LOCK winfsp_mount FIXTURES_REQUIRED conc-prep FIXTURES_SETUP conc-done TIMEOUT 180)
+	add_test(NAME concurrent_fsck.compressed.img COMMAND winapfs-fsck -c ${conc_img})
+	set_tests_properties(concurrent_fsck.compressed.img PROPERTIES FIXTURES_REQUIRED conc-done)
 endif()
 
 # W5: write safety and raw-device writes (always on copies)

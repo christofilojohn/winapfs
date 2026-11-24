@@ -506,8 +506,21 @@ private:
 	int Decompressed(uint64_t &inode)
 	{
 		Stat st;
-		if (!GetStat(inode, st) || !st.compressed)
+		if (!GetStat(inode, st))
+			return -2;
+		if (!st.compressed)
+		{
+			inode = st.inode;
 			return 0;
+		}
+		std::lock_guard<std::mutex> dlock(m_decompress_mutex);
+		if (!GetStat(inode, st))
+			return -2;
+		if (!st.compressed)
+		{
+			inode = st.inode;
+			return 0;
+		}
 		NodeRef p = Get(st.parent);
 		std::vector<DirEntry> ents;
 		if (!p || !ListDir(st.parent, ents))
@@ -666,6 +679,7 @@ private:
 	apfsrw_mount *m_mount;
 	apfsrw_node *m_root = nullptr;
 	std::mutex m_mutex;
+	std::mutex m_decompress_mutex;
 	std::unordered_map<uint64_t, Entry> m_nodes;
 	std::list<uint64_t> m_lru;   // least recently used first
 	std::unordered_map<uint64_t, uint64_t> m_alias;   // decompressed: old inode -> new
