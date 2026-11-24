@@ -17,6 +17,7 @@ int kshim_module_init(void);
 /* kshim */
 int kshim_bdev_register(const wchar_t *path, u64 offset, u64 size, bool writable, char *name, size_t name_size);
 void kshim_bdev_unregister(const char *name);
+bool kshim_bdev_io_failed(struct block_device *bdev);
 struct file_system_type *kshim_get_fs_type(const char *name);
 void kshim_deactivate_super(struct super_block *sb);
 void kshim_set_log_sink(void (*sink)(int level, const char *msg));
@@ -104,6 +105,11 @@ int apfsrw_sync(apfsrw_mount *m)
 bool apfsrw_is_readwrite(apfsrw_mount *m)
 {
 	return !sb_rdonly(m->sb);
+}
+
+bool apfsrw_io_failed(apfsrw_mount *m)
+{
+	return m && m->sb && kshim_bdev_io_failed(m->sb->s_bdev);
 }
 
 int apfsrw_get_statfs(apfsrw_mount *m, apfsrw_statfs *st)

@@ -596,10 +596,17 @@ void PaintWindow(HWND hwnd)
 					float right_edge = card.GetRight() - 16.0f * s;
 					std::wstring vname = ToWide(v.name.empty() ? "APFS Volume" : v.name);
 
+					bool io_err = v.note.compare(0, 10, "I/O error:") == 0;
 					std::wstring pill_txt = L"Unmounted";
 					Gdiplus::Color pill_bg = pal.btn_bg;
 					Gdiplus::Color pill_fg = pal.text_secondary;
-					if (mounted)
+					if (mounted && io_err)
+					{
+						pill_txt = L"I/O Error";
+						pill_bg = pal.red_pill_bg;
+						pill_fg = pal.red_pill_fg;
+					}
+					else if (mounted)
 					{
 						pill_txt = rw ? L"Read-Write" : L"Read-Only";
 						pill_bg = rw ? pal.amber_pill_bg : pal.green_pill_bg;
@@ -661,7 +668,7 @@ void PaintWindow(HWND hwnd)
 					float cur_y = card.Y + 62.0f * s;
 					if (has_note)
 					{
-						Gdiplus::SolidBrush note_br(v.state == "failed" ? pal.red_pill_fg : pal.text_muted);
+						Gdiplus::SolidBrush note_br((v.state == "failed" || io_err) ? pal.red_pill_fg : pal.text_muted);
 						g.DrawString(ToWide(v.note).c_str(), -1, &f_small, Gdiplus::RectF(text_x, cur_y, right_edge - text_x, 18.0f * s), &lfmt, &note_br);
 						cur_y += 20.0f * s;
 					}

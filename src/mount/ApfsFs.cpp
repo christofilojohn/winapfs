@@ -716,9 +716,17 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 create_options, UIN
 
 static void Refresh(ApfsFs *self, ApfsFs::Node *node)
 {
+	uint64_t ino;
+	{
+		std::lock_guard<std::mutex> lock(node->mutex);
+		ino = node->st.inode;
+	}
 	Stat st;
-	if (self->Vol().GetStat(node->st.inode, st))
+	if (self->Vol().GetStat(ino, st))
+	{
+		std::lock_guard<std::mutex> lock(node->mutex);
 		node->st = st;
+	}
 }
 
 static uint32_t ModeForAttributes(uint32_t mode, uint32_t attrs)

@@ -329,6 +329,7 @@ public:
 				const VolStatus &s = kv.second;
 				std::string letter = "-", mode = "-";
 				uint64_t rbytes = 0, wbytes = 0;
+				bool io_failed = false;
 				for (const auto &m : d->mounts)
 					if (m.uuid == kv.first)
 					{
@@ -336,10 +337,12 @@ public:
 						mode = m.fs->Vol().Writable() ? "rw" : "ro";
 						rbytes = m.fs->ReadBytes();
 						wbytes = m.fs->WriteBytes();
+						io_failed = m.fs->Vol().IoFailed();
 					}
 				bool hide = m_cfg.Dword(VolKey(kv.first), L"HideDotfiles", m_cfg.Dword(L"", L"HideDotfiles", 1)) != 0;
+				std::string note = io_failed ? "I/O error: writes blocked; unmount/eject and check disk" : s.note;
 				out.push_back("vol\t" + kv.first + "\t" + Clean(s.name) + "\t" + s.state + "\t" + letter + "\t" + mode + "\t" +
-					d->path + "\t" + Clean(s.note) + "\t" + (hide ? "1" : "0") + "\t" +
+					d->path + "\t" + Clean(note) + "\t" + (hide ? "1" : "0") + "\t" +
 					std::to_string(rbytes) + "\t" + std::to_string(wbytes));
 			}
 		out.push_back("cfg\tAllowDiskWrites\t" + std::to_string(m_cfg.Dword(L"", L"AllowDiskWrites", 0)));

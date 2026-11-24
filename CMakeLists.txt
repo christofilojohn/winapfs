@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(winapfs VERSION 0.7.6 LANGUAGES C CXX)
+project(winapfs VERSION 0.7.7 LANGUAGES C CXX)
 
 if(NOT MSVC)
 	message(FATAL_ERROR "winapfs is built with MSVC")

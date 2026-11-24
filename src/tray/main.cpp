@@ -391,12 +391,18 @@ void StartPollAsync()
 			if (!g_first_poll && up)
 				for (const auto &v : vols)
 				{
-					std::string now = v.state + "|" + v.letter + "|" + v.mode;
+					bool io_err = v.note.compare(0, 10, "I/O error:") == 0;
+					std::string now = v.state + "|" + v.letter + "|" + v.mode + (io_err ? "|ioerr" : "");
 					auto it = g_seen.find(v.uuid);
 					std::string before = it == g_seen.end() ? "" : it->second;
 					if (before == now)
 						continue;
-					if (v.state == "mounted")
+					if (v.state == "mounted" && io_err)
+					{
+						if (before.find("|ioerr") == std::string::npos)
+							notes.emplace_back(W(v.name) + L" write error", L"Disk I/O error detected \x2014 writes are blocked. Unmount/eject and check the disk.");
+					}
+					else if (v.state == "mounted")
 						notes.emplace_back(W(v.name) + L" is ready", L"Mounted at " + W(v.letter) + L" (" + StateText(v) + L")");
 					else if (v.state == "locked" && before.compare(0, 6, "locked") != 0)
 					{
@@ -420,7 +426,10 @@ void StartPollAsync()
 				}
 			g_seen.clear();
 			for (const auto &v : vols)
-				g_seen[v.uuid] = v.state + "|" + v.letter + "|" + v.mode;
+			{
+				bool io_err = v.note.compare(0, 10, "I/O error:") == 0;
+				g_seen[v.uuid] = v.state + "|" + v.letter + "|" + v.mode + (io_err ? "|ioerr" : "");
+			}
 			if (!locked_uuid.empty())
 				g_balloon_uuid = locked_uuid;
 			g_first_poll = !up;

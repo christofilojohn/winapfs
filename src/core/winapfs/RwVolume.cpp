@@ -319,6 +319,7 @@ public:
 	// ---------------------------------------------------------------- writing
 
 	bool Writable() const override { return apfsrw_is_readwrite(m_mount); }
+	bool IoFailed() const override { return apfsrw_io_failed(m_mount); }
 
 	int Create(uint64_t parent, const std::string &name, bool dir, uint32_t mode, DirEntry &out) override
 	{

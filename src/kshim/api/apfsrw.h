@@ -75,6 +75,7 @@ int apfsrw_unmount(apfsrw_mount *m);
 int apfsrw_sync(apfsrw_mount *m);
 int apfsrw_get_statfs(apfsrw_mount *m, apfsrw_statfs *st);
 bool apfsrw_is_readwrite(apfsrw_mount *m);
+bool apfsrw_io_failed(apfsrw_mount *m);
 
 int apfsrw_root(apfsrw_mount *m, apfsrw_node **out);
 /* -ENOENT if the name does not exist */
