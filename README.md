@@ -44,14 +44,17 @@ no driver signing, nothing proprietary.
   APFS volume when a disk is connected, remembers its pinned drive letter,
   flushes writable volumes on unmount, and unmounts cleanly on "Safely Remove
   Hardware", unplugging and shutdown. Uses 4 MiB aligned I/O batching and
-  pooled bounce buffers for fast Thunderbolt / USB4 external SSD transfers.
+  pooled bounce buffers for fast Thunderbolt / USB4 external SSD transfers, and
+  latches fatal write/flush errors to block further writes if a drive
+  disconnects or a barrier fails.
 - **Modern Dashboard & tray app.** Manage every volume from the Windows 11
   Fluent Dashboard (left-click the tray icon) or tray menu: open in Explorer,
   mount/unmount, **Safely Eject** (flush + unmount + eject confirmation), switch
   read-only / read-write, pin drive letters (`D:`–`Z:`), toggle hiding macOS
   dotfiles (`._*`, `.DS_Store`), view live **Read / Write MB/s** throughput and
-  disk usage, run **Verify Disk** (`winapfs-fsck`), and check for / install
-  updates directly from GitHub Releases.
+  disk usage, see immediate **"I/O Error"** alerts if a disk write/flush fails,
+  run non-blocking **Verify Disk** (`winapfs-fsck` via a concurrent service
+  control pipe), and check for / install updates directly from GitHub Releases.
 - **Faithful to the Mac side.**
   - Unicode file names exactly as stored, including characters Windows forbids
     (`: ? * | < > "`), which are mapped and round-trip
@@ -75,7 +78,7 @@ no driver signing, nothing proprietary.
 |---|---|
 | Reading (files, metadata, xattrs, links, compression) | ✅ Stable, checked against manifests made on macOS |
 | Encrypted volumes | ✅ Read-only |
-| Writing to unencrypted volumes | 🧪 Experimental. Passes crash/consistency tests, and `winapfs`-written test images (`basic`, `compressed`, `links`, `casesensitive`) are validated in CI with Apple's `fsck_apfs -n -l` and macOS read-only mounts; physical-disk writes remain opt-in and experimental |
+| Writing to unencrypted volumes | 🧪 Experimental. Passes crash/consistency and 8-thread concurrent write tests, and 7 `winapfs`-written test images (`basic`, `casesensitive`, `compressed`, `conc-compressed`, `links`, `multivol`, `w5-multivol`) are validated in CI with Apple's `fsck_apfs -n -l` and macOS read-only mounts; physical-disk writes remain opt-in and experimental |
 | Writing to encrypted volumes, snapshots | ⏳ Planned |
 | Fusion drives, Time Machine and macOS system volumes (writing) | ⛔ Refused (read-only) |
 
@@ -179,7 +182,7 @@ flowchart LR
 
 ### Testing
 
-The test suite (150 tests, `ctest`) runs against disk images made on macOS by a
+The test suite (155 tests, `ctest`) runs against disk images made on macOS by a
 generator script (`testdata/generator`), with a manifest of every file's
 contents and metadata:
 
@@ -188,15 +191,20 @@ contents and metadata:
 - write tests replay hundreds of operations (renames, hard links, xattrs,
   compressed files, odd names) through the engine and through Explorer-style
   Win32 calls, then verify the result with both readers and `fsck`;
+- **8-thread concurrent write stress test** (`winapfs-concurrent-test`) runs
+  parallel file churn, concurrent compressed-file overwrites, ADS/xattr writes,
+  and directory queries through a live `--rw` WinFsp mount, then verifies
+  data integrity and `winapfs-fsck -c`;
 - **crash tests** cut the power at evenly spread points during a write storm
   (including a simulated volatile disk cache) and require a clean `fsck` and
   the last synced state, intact;
 - regression tests for long copies, disk-full, memory bounds and the
   installer's service;
 - **cross-OS macOS `fsck_apfs` validation** (`.github/workflows/fsck-apfs.yml`):
-  generates macOS APFS images (`basic`, `compressed`, `links`, `casesensitive`),
-  runs `apfsrw-writetest` and `winapfs-fsck -c` on Windows, then sends the
-  written images back to macOS to verify them with Apple's `fsck_apfs -n -l`
+  generates real macOS APFS images, runs the full 6-stage `ctest` suite
+  (155 tests) on Windows, then sends all 7 WinFsp-written images (`basic`,
+  `casesensitive`, `compressed`, `conc-compressed`, `links`, `multivol`,
+  `w5-multivol`) back to macOS to verify them with Apple's `fsck_apfs -n -l`
   and read-only `hdiutil` mounts.
 
 ## Build from source
@@ -214,7 +222,7 @@ powershell -File installer\build.ps1 -WinFspMsi path\to\winfsp.msi  # also build
 ```
 
 GitHub Actions (`.github/workflows/build.yml`) automates Release builds, unit
-tests (`unit.names`), and both `.msi` and `-setup.exe` installers on
+tests (`unit.names`, `unit.control`), and both `.msi` and `-setup.exe` installers on
 `windows-2022`.
 
 The test images (2.7 GB) are not in the repository. Make them on a Mac with
