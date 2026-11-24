@@ -70,6 +70,7 @@ public:
 	// flush, unmount).
 	uint64_t EffectiveSize(const Stat &st);
 	void SetPendingSize(uint64_t inode, uint64_t size);   // 0 = none
+	void ClearPendingSizeIfAtMost(uint64_t inode, uint64_t reached);
 	uint64_t PendingSize(uint64_t inode);
 	int ApplyPendingSize(uint64_t inode);
 	void ApplyAllPendingSizes();
@@ -86,7 +87,7 @@ private:
 	bool FollowLink(uint64_t dir, const std::string &target, int depth, Stat &out);
 	std::string LocalTarget(const std::string &target);
 	bool CacheGet(const std::wstring &dir, uint64_t &inode, std::wstring &normalized);
-	void CachePut(const std::wstring &dir, uint64_t inode, const std::wstring &normalized);
+	void CachePut(const std::wstring &dir, uint64_t inode, const std::wstring &normalized, uint64_t gen);
 
 	std::unique_ptr<Volume> m_vol;
 	MountOptions m_opts;
@@ -99,6 +100,7 @@ private:
 	// (the hot part of path resolution); entries never go stale on a read-only
 	// volume.
 	std::mutex m_cache_mutex;
+	uint64_t m_cache_gen = 0;
 	std::unordered_map<std::wstring, std::pair<uint64_t, std::wstring>> m_dir_cache;
 
 	std::mutex m_pending_mutex;

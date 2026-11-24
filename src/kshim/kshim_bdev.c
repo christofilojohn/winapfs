@@ -46,6 +46,27 @@ static volatile LONG64 g_reads, g_read_bytes, g_writes, g_write_bytes;
 extern volatile LONG64 g_ra_pieces;   /* kshim_pagecache.c */
 static SRWLOCK g_bdev_lock = SRWLOCK_INIT;
 
+static int win32_err_to_errno(DWORD e)
+{
+	switch (e) {
+	case ERROR_FILE_NOT_FOUND:
+	case ERROR_PATH_NOT_FOUND:
+		return -ENOENT;
+	case ERROR_ACCESS_DENIED:
+		return -EACCES;
+	case ERROR_SHARING_VIOLATION:
+	case ERROR_LOCK_VIOLATION:
+		return -EBUSY;
+	case ERROR_WRITE_PROTECT:
+		return -EROFS;
+	case ERROR_NOT_ENOUGH_MEMORY:
+	case ERROR_OUTOFMEMORY:
+		return -ENOMEM;
+	default:
+		return -EIO;
+	}
+}
+
 int kshim_bdev_register(const wchar_t *path, u64 offset, u64 size, bool writable, char *name, size_t name_size)
 {
 	HANDLE h;
@@ -81,7 +102,7 @@ int kshim_bdev_register(const wchar_t *path, u64 offset, u64 size, bool writable
 	h = CreateFileW(path, GENERIC_READ | (writable ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE,
 			NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, NULL);
 	if (h == INVALID_HANDLE_VALUE)
-		return -(int)GetLastError();
+		return win32_err_to_errno(GetLastError());
 
 	if (!size) {
 		LARGE_INTEGER sz;

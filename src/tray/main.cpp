@@ -107,12 +107,30 @@ bool g_first_poll = true;
 std::string g_balloon_uuid;            // a locked volume the last notification was about
 std::atomic<bool> g_polling{ false };
 std::atomic<bool> g_exiting{ false };
+std::atomic<int> g_bg_threads{ 0 };
 std::atomic<bool> g_checking_update{ false };
 std::atomic<bool> g_downloading_update{ false };
 UpdateInfo g_update;
 std::string g_update_status_text;
 DashboardState g_last_dash;
 bool g_last_balloon_is_update = false;
+
+struct BgThreadGuard
+{
+	~BgThreadGuard() { g_bg_threads.fetch_sub(1, std::memory_order_release); }
+};
+
+template <typename Fn>
+void SpawnBg(Fn &&fn)
+{
+	if (g_exiting.load())
+		return;
+	g_bg_threads.fetch_add(1, std::memory_order_relaxed);
+	std::thread([f = std::forward<Fn>(fn)]() mutable {
+		BgThreadGuard guard;
+		f();
+	}).detach();
+}
 
 struct PollUiUpdate
 {
@@ -327,7 +345,7 @@ void StartPollAsync()
 {
 	if (g_exiting.load() || g_polling.exchange(true))
 		return;
-	std::thread([] {
+	SpawnBg([] {
 		std::vector<VolumeStatus> vols;
 		bool allow = false;
 		std::string err;
@@ -489,7 +507,7 @@ void StartPollAsync()
 
 		if (up && !auto_unlock_candidates.empty())
 		{
-			std::thread([cands = std::move(auto_unlock_candidates)] {
+			SpawnBg([cands = std::move(auto_unlock_candidates)] {
 				for (const auto &v : cands)
 				{
 					if (g_exiting.load())
@@ -507,15 +525,15 @@ void StartPollAsync()
 					if (g_exiting.load() || !PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
 						delete msg;
 				}
-			}).detach();
+			});
 		}
-	}).detach();
+	});
 }
 
 // Runs a request off the UI thread; failures come back as a notification.
 void Request(std::string req, const std::wstring &what)
 {
-	std::thread([req = std::move(req), what]() mutable {
+	SpawnBg([req = std::move(req), what]() mutable {
 		std::vector<std::string> lines;
 		std::string err;
 		int rc = ControlRequest(g_pipe, req, lines, err);
@@ -525,9 +543,9 @@ void Request(std::string req, const std::wstring &what)
 			req.clear();
 		}
 		std::wstring *msg = rc ? new std::wstring(what + L": " + W(err)) : nullptr;
-		if (!PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
+		if (g_exiting.load() || !PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
 			delete msg;
-	}).detach();
+	});
 }
 
 // winapfs.exe with administrator rights (one UAC prompt); true if it ran and succeeded
@@ -634,7 +652,7 @@ void ActionUnlock(VolumeStatus v)
 	bool remember = d.remember;
 	bool had_saved = d.has_saved;
 	std::wstring vname = d.name;
-	std::thread([req = std::move(req), v, remember, had_saved, wpw = std::move(wpw_copy), vname]() mutable {
+	SpawnBg([req = std::move(req), v, remember, had_saved, wpw = std::move(wpw_copy), vname]() mutable {
 		std::vector<std::string> lines;
 		std::string err;
 		int rc = ControlRequest(g_pipe, req, lines, err);
@@ -659,7 +677,7 @@ void ActionUnlock(VolumeStatus v)
 			msg = new std::wstring(W(err));
 		if (g_exiting.load() || !PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
 			delete msg;
-	}).detach();
+	});
 }
 
 void ActionOpen(const VolumeStatus &v)
@@ -682,7 +700,7 @@ void ActionEject(const VolumeStatus &v)
 	std::string uuid = v.uuid;
 	std::wstring name = W(v.name);
 	Notify(L"Safely ejecting disk", L"Flushing APFS cache and unmounting volumes\x2026");
-	std::thread([uuid, name] {
+	SpawnBg([uuid, name] {
 		std::vector<std::string> lines;
 		std::string err;
 		int rc = ControlRequest(g_pipe, "eject\t" + uuid, lines, err);
@@ -692,7 +710,7 @@ void ActionEject(const VolumeStatus &v)
 		res->err = err;
 		if (g_exiting.load() || !PostMessageW(g_wnd, WM_EJECT_DONE, 0, reinterpret_cast<LPARAM>(res)))
 			delete res;
-	}).detach();
+	});
 }
 
 void ActionToggleReadWrite(VolumeStatus v)
@@ -765,7 +783,7 @@ void ActionVerify(const VolumeStatus &v)
 	SyncDashboardState(g_last_dash);
 	std::string uuid = v.uuid;
 	std::wstring name = W(v.name);
-	std::thread([uuid, name] {
+	SpawnBg([uuid, name] {
 		std::vector<std::string> lines;
 		std::string err;
 		int rc = ControlRequest(g_pipe, "verify\t" + uuid, lines, err);
@@ -791,7 +809,7 @@ void ActionVerify(const VolumeStatus &v)
 		}
 		if (g_exiting.load() || !PostMessageW(g_wnd, WM_VERIFY_DONE, 0, reinterpret_cast<LPARAM>(res)))
 			delete res;
-	}).detach();
+	});
 }
 
 void ActionForgetPassword(const VolumeStatus &v)
@@ -808,12 +826,12 @@ void ActionToggleAllowWrites(bool allow)
 			L"against macOS. Keep a backup of anything on the disk.\n\nYou will then choose \"Read-write\" per volume. "
 			L"Windows asks for administrator rights once.", L"winapfs", MB_OKCANCEL | MB_ICONWARNING) != IDOK)
 		return;
-	std::thread([allow, owner] {
+	SpawnBg([allow, owner] {
 		bool ok = RunElevated(allow ? L"service config AllowDiskWrites 0" : L"service config AllowDiskWrites 1", owner);
 		std::wstring *msg = ok ? nullptr : new std::wstring(L"The setting was not changed");
-		if (!PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
+		if (g_exiting.load() || !PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
 			delete msg;
-	}).detach();
+	});
 }
 
 void ActionRescan()
@@ -824,23 +842,23 @@ void ActionRescan()
 void ActionStartService()
 {
 	HWND owner = DialogOwner();
-	std::thread([owner] {
+	SpawnBg([owner] {
 		bool ok = RunElevated(L"service start", owner);
 		std::wstring *msg = ok ? nullptr : new std::wstring(L"The winapfs service could not be started");
-		if (!PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
+		if (g_exiting.load() || !PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
 			delete msg;
-	}).detach();
+	});
 }
 
 void ActionInstallService()
 {
 	HWND owner = DialogOwner();
-	std::thread([owner] {
+	SpawnBg([owner] {
 		bool ok = RunElevated(L"service install", owner);
 		std::wstring *msg = ok ? nullptr : new std::wstring(L"The winapfs service could not be installed");
-		if (!PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
+		if (g_exiting.load() || !PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg)))
 			delete msg;
-	}).detach();
+	});
 }
 
 void ActionOpenReleasePage()
@@ -854,14 +872,14 @@ void ActionCheckUpdates(bool interactive)
 	if (g_exiting.load() || g_checking_update.exchange(true))
 		return;
 	SyncDashboardState(g_last_dash);
-	std::thread([interactive] {
+	SpawnBg([interactive] {
 		auto *res = new UpdateResultMsg;
 		res->info = CheckForUpdates(WINAPFS_VERSION_STR);
 		res->interactive = interactive;
 		g_checking_update.store(false);
 		if (g_exiting.load() || !PostMessageW(g_wnd, WM_UPDATE_RESULT, 0, reinterpret_cast<LPARAM>(res)))
 			delete res;
-	}).detach();
+	});
 }
 
 void ActionInstallUpdate()
@@ -878,13 +896,13 @@ void ActionInstallUpdate()
 	std::string url = g_update.download_url;
 	std::string asset = g_update.asset_name;
 	SyncDashboardState(g_last_dash);
-	std::thread([url, asset] {
+	SpawnBg([url, asset] {
 		auto *dl = new UpdateDownloadMsg;
 		dl->ok = DownloadUpdateInstaller(url, asset, dl->path, dl->err);
 		g_downloading_update.store(false);
 		if (g_exiting.load() || !PostMessageW(g_wnd, WM_UPDATE_DOWNLOAD_DONE, 0, reinterpret_cast<LPARAM>(dl)))
 			delete dl;
-	}).detach();
+	});
 }
 
 // ---------------------------------------------------------------- menu
@@ -1353,6 +1371,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 		TranslateMessage(&msg);
 		DispatchMessageW(&msg);
 	}
+	g_exiting.store(true);
+	for (int i = 0; i < 100 && g_bg_threads.load(std::memory_order_acquire) > 0; i++)
+		Sleep(20);
 	if (tray_icon)
 		DestroyIcon(tray_icon);
 	Gdiplus::GdiplusShutdown(gdip_token);

@@ -34,6 +34,7 @@ struct ApfsFs::Node
 	std::string stream;         // named stream = this xattr; empty = the file's data
 	std::mutex mutex;
 	std::shared_ptr<FileReader> reader;   // shared: Read uses it outside the lock
+	uint64_t reader_gen = 0;
 	PVOID dir_buffer = nullptr;
 };
 
@@ -365,6 +366,14 @@ void ApfsFs::SetPendingSize(uint64_t inode, uint64_t size)
 		m_pending_size.erase(inode);
 }
 
+void ApfsFs::ClearPendingSizeIfAtMost(uint64_t inode, uint64_t reached)
+{
+	std::lock_guard<std::mutex> lock(m_pending_mutex);
+	auto it = m_pending_size.find(inode);
+	if (it != m_pending_size.end() && it->second <= reached)
+		m_pending_size.erase(it);
+}
+
 uint64_t ApfsFs::EffectiveSize(const Stat &st)
 {
 	if (st.type != FileType::File)
@@ -378,11 +387,16 @@ int ApfsFs::ApplyPendingSize(uint64_t inode)
 	uint64_t want = PendingSize(inode);
 	if (!want)
 		return 0;
-	SetPendingSize(inode, 0);
 	Stat st;
 	if (!m_vol->GetStat(inode, st) || st.size >= want)
+	{
+		ClearPendingSizeIfAtMost(inode, want);
 		return 0;
-	return m_vol->SetSize(inode, want);
+	}
+	int err = m_vol->SetSize(inode, want);
+	if (!err)
+		ClearPendingSizeIfAtMost(inode, want);
+	return err;
 }
 
 void ApfsFs::ApplyAllPendingSizes()
@@ -445,9 +459,11 @@ bool ApfsFs::CacheGet(const std::wstring &dir, uint64_t &inode, std::wstring &no
 	return true;
 }
 
-void ApfsFs::CachePut(const std::wstring &dir, uint64_t inode, const std::wstring &normalized)
+void ApfsFs::CachePut(const std::wstring &dir, uint64_t inode, const std::wstring &normalized, uint64_t gen)
 {
 	std::lock_guard<std::mutex> lock(m_cache_mutex);
+	if (gen != m_cache_gen)
+		return;
 	if (m_dir_cache.size() >= kDirCacheMax)
 		m_dir_cache.clear();
 	m_dir_cache.emplace(dir, std::make_pair(inode, normalized));
@@ -495,6 +511,11 @@ NTSTATUS ApfsFs::Resolve(const wchar_t *path, Stat &st, std::wstring *normalized
 	uint64_t cur = kRootInode;
 	std::wstring norm;
 	size_t first = 0;
+	uint64_t cache_gen;
+	{
+		std::lock_guard<std::mutex> lock(m_cache_mutex);
+		cache_gen = m_cache_gen;
+	}
 
 	// longest cached directory prefix
 	for (size_t k = comps.size(); k > 0; k--)
@@ -528,7 +549,7 @@ NTSTATUS ApfsFs::Resolve(const wchar_t *path, Stat &st, std::wstring *normalized
 		{
 			if (e.type != FileType::Dir)
 				return STATUS_OBJECT_PATH_NOT_FOUND;
-			CachePut(key, e.inode, norm);
+			CachePut(key, e.inode, norm, cache_gen);
 		}
 		cur = e.inode;
 	}
@@ -572,6 +593,7 @@ NTSTATUS ApfsFs::ResolveParent(const wchar_t *path, uint64_t &parent, std::strin
 void ApfsFs::InvalidateCache()
 {
 	std::lock_guard<std::mutex> lock(m_cache_mutex);
+	m_cache_gen++;
 	m_dir_cache.clear();
 }
 
@@ -661,20 +683,41 @@ static NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM *fs, PWSTR name, PUINT32 attrs
 	return self->CopySecurity(sd, sd_size);
 }
 
-// File info of an open node; a named stream reports the xattr's size.
-static void FillNodeInfo(ApfsFs *self, ApfsFs::Node *node, FSP_FSCTL_FILE_INFO &fi)
+// File info from copied/locked node state; a named stream reports the xattr's size.
+static void FillNodeInfoLocked(ApfsFs *self, const Stat &st, const std::string &name, const std::string &stream, FSP_FSCTL_FILE_INFO &fi)
 {
-	self->FillFileInfo(node->st, node->name, fi);
-	if (node->stream.empty())
+	self->FillFileInfo(st, name, fi);
+	if (stream.empty())
 		return;
 	uint64_t size = 0, bs = 4096;
-	self->Vol().GetXattrSize(node->st.inode, node->stream, size);
+	self->Vol().GetXattrSize(st.inode, stream, size);
 	fi.FileAttributes &= ~(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT);
 	if (!fi.FileAttributes)
 		fi.FileAttributes = FILE_ATTRIBUTE_ARCHIVE;
 	fi.ReparseTag = 0;
 	fi.FileSize = size;
 	fi.AllocationSize = (size + bs - 1) / bs * bs;
+}
+
+static void SnapshotNode(ApfsFs::Node *node, Stat &st, std::string &name)
+{
+	std::lock_guard<std::mutex> lock(node->mutex);
+	st = node->st;
+	name = node->name;
+}
+
+// File info of an open node; a named stream reports the xattr's size.
+static void FillNodeInfo(ApfsFs *self, ApfsFs::Node *node, FSP_FSCTL_FILE_INFO &fi)
+{
+	Stat st;
+	std::string name, stream;
+	{
+		std::lock_guard<std::mutex> lock(node->mutex);
+		st = node->st;
+		name = node->name;
+		stream = node->stream;
+	}
+	FillNodeInfoLocked(self, st, name, stream, fi);
 }
 
 static NTSTATUS Open(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 create_options, UINT32 granted_access, PVOID *ctx, FSP_FSCTL_FILE_INFO *fi)
@@ -740,13 +783,13 @@ static uint32_t ModeForAttributes(uint32_t mode, uint32_t attrs)
 }
 
 // UF_HIDDEN follows FILE_ATTRIBUTE_HIDDEN (unless --hide-dotfiles already shows it)
-static int SetHidden(ApfsFs *self, ApfsFs::Node *node, uint32_t attrs)
+static int SetHidden(ApfsFs *self, const Stat &st, const std::string &name, uint32_t attrs)
 {
 	bool want = (attrs & FILE_ATTRIBUTE_HIDDEN) != 0;
-	bool have = (self->Attributes(node->st, node->name) & FILE_ATTRIBUTE_HIDDEN) != 0;
+	bool have = (self->Attributes(st, name) & FILE_ATTRIBUTE_HIDDEN) != 0;
 	if (want == have)
 		return 0;
-	return self->Vol().SetFlags(node->st.inode, want ? kUF_HIDDEN : 0, kUF_HIDDEN);
+	return self->Vol().SetFlags(st.inode, want ? kUF_HIDDEN : 0, kUF_HIDDEN);
 }
 
 static void SetNormalizedName(FSP_FSCTL_FILE_INFO *fi, const std::wstring &norm)
@@ -827,10 +870,10 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 create_options, U
 	node->name = aname;
 	if (attrs & FILE_ATTRIBUTE_HIDDEN)
 	{
-		SetHidden(self, node.get(), attrs);
+		SetHidden(self, node->st, node->name, attrs);
 		Refresh(self, node.get());
 	}
-	self->FillFileInfo(node->st, node->name, *fi);
+	FillNodeInfoLocked(self, node->st, node->name, node->stream, *fi);
 	SetNormalizedName(fi, pnorm + L"\\" + ApfsNameToWindows(aname));
 	*ctx = node.release();
 	return STATUS_SUCCESS;
@@ -854,15 +897,18 @@ static NTSTATUS Overwrite(FSP_FILE_SYSTEM *fs, PVOID ctx, UINT32 attrs, BOOLEAN 
 	Refresh(self, node);   // a compressed file is now a new inode
 	if (!err)
 	{
-		uint32_t all = replace ? attrs : (attrs | self->Attributes(node->st, node->name));
-		uint32_t mode = ModeForAttributes(node->st.mode, all);
-		if (mode != (node->st.mode & 07777u))
-			err = self->Vol().SetMode(node->st.inode, mode);
+		Stat st;
+		std::string name;
+		SnapshotNode(node, st, name);
+		uint32_t all = replace ? attrs : (attrs | self->Attributes(st, name));
+		uint32_t mode = ModeForAttributes(st.mode, all);
+		if (mode != (st.mode & 07777u))
+			err = self->Vol().SetMode(st.inode, mode);
 		if (!err)
-			err = SetHidden(self, node, all);
+			err = SetHidden(self, st, name, all);
 	}
 	Refresh(self, node);
-	self->FillFileInfo(node->st, node->name, *fi);
+	FillNodeInfo(self, node, *fi);
 	return Errno(err);
 }
 
@@ -880,7 +926,7 @@ static NTSTATUS WriteStream(ApfsFs *self, ApfsFs::Node *node, PVOID buf, UINT64 
 	{
 		if (off >= data.size())
 		{
-			FillNodeInfo(self, node, *fi);
+			FillNodeInfoLocked(self, node->st, node->name, node->stream, *fi);
 			return STATUS_SUCCESS;
 		}
 		len = static_cast<ULONG>(std::min<uint64_t>(len, data.size() - off));
@@ -893,7 +939,7 @@ static NTSTATUS WriteStream(ApfsFs *self, ApfsFs::Node *node, PVOID buf, UINT64 
 	int err = self->Vol().SetXattr(node->st.inode, node->stream, data.data(), data.size(), 0);
 	if (!err)
 		*transferred = len;
-	FillNodeInfo(self, node, *fi);
+	FillNodeInfoLocked(self, node->st, node->name, node->stream, *fi);
 	return Errno(err);
 }
 
@@ -905,10 +951,13 @@ static NTSTATUS Write(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULO
 	*transferred = 0;
 	if (!node->stream.empty())
 		return WriteStream(self, node, buf, off, len, to_eof, constrained, transferred, fi);
-	if (node->st.type != FileType::File)
-		return STATUS_INVALID_DEVICE_REQUEST;
 	Refresh(self, node);
-	uint64_t size = self->EffectiveSize(node->st);   // includes a pending growth
+	Stat st;
+	std::string name;
+	SnapshotNode(node, st, name);
+	if (st.type != FileType::File)
+		return STATUS_INVALID_DEVICE_REQUEST;
+	uint64_t size = self->EffectiveSize(st);   // includes a pending growth
 	if (to_eof)
 		off = size;
 	if (constrained)
@@ -916,25 +965,25 @@ static NTSTATUS Write(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULO
 		// paging I/O: never extends the file
 		if (off >= size)
 		{
-			self->FillFileInfo(node->st, node->name, *fi);
+			self->FillFileInfo(st, name, *fi);
 			return STATUS_SUCCESS;
 		}
 		len = static_cast<ULONG>(std::min<uint64_t>(len, size - off));
 	}
 	size_t written = 0;
-	int err = self->Vol().Write(node->st.inode, off, buf, len, written);
+	int err = self->Vol().Write(st.inode, off, buf, len, written);
 	*transferred = static_cast<ULONG>(written);
 	if (written)
 		self->AddWriteBytes(written);
-	if (written && off + written >= size)
-		self->SetPendingSize(node->st.inode, 0);   // the data reached the size Windows set
+	if (written)
+		self->ClearPendingSizeIfAtMost(st.inode, off + written);   // cleared only up to what was written
 	{
 		std::lock_guard<std::mutex> lock(node->mutex);
 		node->reader.reset();   // a compressed file was replaced by a plain copy
 	}
 	Refresh(self, node);
-	self->FillFileInfo(node->st, node->name, *fi);
-	if (err == -5)   /* -EIO: never mask a fatal device I/O error behind a partial write */
+	FillNodeInfo(self, node, *fi);
+	if (err == -5 || err == -28)   /* -EIO / -ENOSPC: never mask fatal I/O or disk-full errors behind partial writes */
 		return Errno(err);
 	return written ? STATUS_SUCCESS : Errno(err);
 }
@@ -957,39 +1006,42 @@ static NTSTATUS SetFileSize(FSP_FILE_SYSTEM *fs, PVOID ctx, UINT64 size, BOOLEAN
 			data.resize(static_cast<size_t>(size));
 			err = self->Vol().SetXattr(node->st.inode, node->stream, data.data(), data.size(), 0);
 		}
-		FillNodeInfo(self, node, *fi);
+		FillNodeInfoLocked(self, node->st, node->name, node->stream, *fi);
 		return Errno(err);
 	}
 	Refresh(self, node);
-	uint64_t cur = self->EffectiveSize(node->st);
+	Stat st;
+	std::string name;
+	SnapshotNode(node, st, name);
+	uint64_t cur = self->EffectiveSize(st);
 	if (set_alloc)
 	{
 		// an allocation size below the file size truncates (NTFS semantics);
 		// otherwise allocation requests are hints the engine doesn't need
 		if (size < cur)
 		{
-			self->SetPendingSize(node->st.inode, size > node->st.size ? size : 0);
-			if (size < node->st.size)
-				err = self->Vol().SetSize(node->st.inode, size);
+			self->SetPendingSize(st.inode, size > st.size ? size : 0);
+			if (size < st.size)
+				err = self->Vol().SetSize(st.inode, size);
 		}
 	}
-	else if (size > node->st.size && !node->st.compressed)
+	else if (size > st.size && !st.compressed)
 	{
 		// growth: reported now, written by the data or applied at cleanup
-		self->SetPendingSize(node->st.inode, size);
+		self->SetPendingSize(st.inode, size);
 	}
 	else
 	{
-		self->SetPendingSize(node->st.inode, 0);
-		if (size != node->st.size)
-			err = self->Vol().SetSize(node->st.inode, size);
+		self->SetPendingSize(st.inode, 0);
+		if (size != st.size)
+			err = self->Vol().SetSize(st.inode, size);
 	}
 	{
 		std::lock_guard<std::mutex> lock(node->mutex);
 		node->reader.reset();
 	}
 	Refresh(self, node);
-	self->FillFileInfo(node->st, node->name, *fi);
+	FillNodeInfo(self, node, *fi);
 	return Errno(err);
 }
 
@@ -1000,21 +1052,24 @@ static NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM *fs, PVOID ctx, UINT32 attrs, UINT6
 	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
 	int err = 0;
 	Refresh(self, node);
+	Stat st;
+	std::string name;
+	SnapshotNode(node, st, name);
 	if (attrs != INVALID_FILE_ATTRIBUTES)
 	{
-		if (node->st.type == FileType::File || node->st.type == FileType::Dir)
+		if (st.type == FileType::File || st.type == FileType::Dir)
 		{
-			uint32_t mode = ModeForAttributes(node->st.mode, attrs);
-			if (node->st.type == FileType::File && mode != (node->st.mode & 07777u))
-				err = self->Vol().SetMode(node->st.inode, mode);
+			uint32_t mode = ModeForAttributes(st.mode, attrs);
+			if (st.type == FileType::File && mode != (st.mode & 07777u))
+				err = self->Vol().SetMode(st.inode, mode);
 		}
 		if (!err)
-			err = SetHidden(self, node, attrs);
+			err = SetHidden(self, st, name, attrs);
 	}
 	if (!err && TimeGiven(ctime))
-		err = self->Vol().SetCreateTime(node->st.inode, FileTimeToNs(ctime));
+		err = self->Vol().SetCreateTime(st.inode, FileTimeToNs(ctime));
 	if (!err && (TimeGiven(atime) || TimeGiven(mtime)))
-		err = self->Vol().SetTimes(node->st.inode, TimeGiven(atime) ? FileTimeToNs(atime) : INT64_MIN,
+		err = self->Vol().SetTimes(st.inode, TimeGiven(atime) ? FileTimeToNs(atime) : INT64_MIN,
 			TimeGiven(mtime) ? FileTimeToNs(mtime) : INT64_MIN);
 	Refresh(self, node);
 	FillNodeInfo(self, node, *fi);
@@ -1085,7 +1140,10 @@ static NTSTATUS Rename(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, PWSTR new_nam
 	if (err == -21 || err == -20)   /* EISDIR/ENOTDIR: replacing across file and directory */
 		return STATUS_ACCESS_DENIED;
 	if (!err)
+	{
+		std::lock_guard<std::mutex> lock(node->mutex);
 		node->name = nn;
+	}
 	self->InvalidateCache();
 	return Errno(err);
 }
@@ -1139,8 +1197,17 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULON
 		return STATUS_INVALID_DEVICE_REQUEST;
 
 	std::shared_ptr<FileReader> reader;
+	uint64_t ino = 0;
 	{
 		std::lock_guard<std::mutex> lock(node->mutex);
+		uint64_t gen = self->Vol().DecompressGen();
+		if (node->reader && node->reader_gen != gen)
+		{
+			node->reader.reset();
+			Stat updated;
+			if (self->Vol().GetStat(node->st.inode, updated))
+				node->st = updated;
+		}
 		if (!node->reader)
 		{
 			std::string err;
@@ -1151,11 +1218,13 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULON
 					fprintf(stderr, "open inode %llu: %s\n", static_cast<unsigned long long>(node->st.inode), err.c_str());
 				return STATUS_FILE_CORRUPT_ERROR;
 			}
+			node->reader_gen = gen;
 		}
 		reader = node->reader;
+		ino = node->st.inode;
 	}
 
-	uint64_t size = std::max<uint64_t>(reader->Size(), self->PendingSize(node->st.inode));
+	uint64_t size = std::max<uint64_t>(reader->Size(), self->PendingSize(ino));
 	if (off >= size)
 		return STATUS_END_OF_FILE;
 
@@ -1194,10 +1263,13 @@ static NTSTATUS GetStreamInfo(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, ULONG l
 	if (self->Vol().Writable())
 		Refresh(self, node);
 	*transferred = 0;
-	if (node->st.type == FileType::File)
+	Stat st;
+	std::string name;
+	SnapshotNode(node, st, name);
+	if (st.type == FileType::File)
 	{
 		FSP_FSCTL_FILE_INFO fi;
-		self->FillFileInfo(node->st, node->name, fi);
+		self->FillFileInfo(st, name, fi);
 		si->Size = sizeof(FSP_FSCTL_STREAM_INFO);   // the unnamed data stream
 		si->StreamSize = fi.FileSize;
 		si->StreamAllocationSize = fi.AllocationSize;
@@ -1295,12 +1367,24 @@ static NTSTATUS SetReparsePoint(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, PVOI
 	if (err)
 	{
 		DirEntry back;   // put the empty file or directory back
-		if (self->Vol().Create(parent, aname, was_dir, node->st.mode & 07777, back) == 0)
-			self->Vol().GetStat(back.inode, node->st);
+		Stat st_cur;
+		std::string name_cur;
+		SnapshotNode(node, st_cur, name_cur);
+		if (self->Vol().Create(parent, aname, was_dir, st_cur.mode & 07777, back) == 0 &&
+		    self->Vol().GetStat(back.inode, st_cur))
+		{
+			std::lock_guard<std::mutex> lock(node->mutex);
+			node->st = st_cur;
+		}
 		self->InvalidateCache();
 		return Errno(err);
 	}
-	self->Vol().GetStat(e.inode, node->st);
+	Stat st_new;
+	if (self->Vol().GetStat(e.inode, st_new))
+	{
+		std::lock_guard<std::mutex> lock(node->mutex);
+		node->st = st_new;
+	}
 	self->InvalidateCache();
 	return STATUS_SUCCESS;
 }
@@ -1314,9 +1398,12 @@ static NTSTATUS DeleteReparsePoint(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, P
 	if (!self->Vol().Writable())
 		return STATUS_MEDIA_WRITE_PROTECTED;
 	Refresh(self, node);
-	if (node->st.type != FileType::Symlink)
+	Stat st_cur;
+	std::string name_cur;
+	SnapshotNode(node, st_cur, name_cur);
+	if (st_cur.type != FileType::Symlink)
 		return STATUS_NOT_A_REPARSE_POINT;
-	bool dir = self->SymlinkIsDir(node->st);
+	bool dir = self->SymlinkIsDir(st_cur);
 	uint64_t parent;
 	std::string aname;
 	NTSTATUS st = self->ResolveParent(name, parent, aname, nullptr);
@@ -1327,7 +1414,14 @@ static NTSTATUS DeleteReparsePoint(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, P
 	if (!err)
 		err = self->Vol().Create(parent, aname, dir, dir ? 0755 : 0644, e);
 	if (!err)
-		self->Vol().GetStat(e.inode, node->st);
+	{
+		Stat st_new;
+		if (self->Vol().GetStat(e.inode, st_new))
+		{
+			std::lock_guard<std::mutex> lock(node->mutex);
+			node->st = st_new;
+		}
+	}
 	self->InvalidateCache();
 	return Errno(err);
 }

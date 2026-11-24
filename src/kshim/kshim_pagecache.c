@@ -572,7 +572,6 @@ struct folio *readahead_folio(struct readahead_control *rac)
 	rac->_nr_pages--;
 	if (IS_ERR(f))
 		return NULL;
-	folio_put(f);   /* readahead_folio returns the folio without an extra ref */
 	return f;
 }
 
@@ -791,8 +790,48 @@ void end_buffer_write_sync(struct buffer_head *bh, int uptodate)
 #define PLUG_MAX	8192
 #define PLUG_BYTES	KSHIM_IO_BATCH_BYTES
 
-static __declspec(thread) struct buffer_head **t_plug;
-static __declspec(thread) size_t t_plug_n, t_plug_cap;
+struct kshim_plug {
+	struct buffer_head **v;
+	size_t n;
+	size_t cap;
+};
+
+static INIT_ONCE g_plug_once = INIT_ONCE_STATIC_INIT;
+static DWORD g_plug_fls = FLS_OUT_OF_INDEXES;
+
+static VOID WINAPI kshim_fls_free_plug(PVOID data)
+{
+	struct kshim_plug *p = (struct kshim_plug *)data;
+	if (p) {
+		free(p->v);
+		free(p);
+	}
+}
+
+static BOOL CALLBACK kshim_init_plug_fls(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+	(void)once;
+	(void)param;
+	(void)ctx;
+	g_plug_fls = FlsAlloc(kshim_fls_free_plug);
+	return g_plug_fls != FLS_OUT_OF_INDEXES;
+}
+
+static struct kshim_plug *kshim_get_plug(bool create)
+{
+	struct kshim_plug *p;
+	if (!InitOnceExecuteOnce(&g_plug_once, kshim_init_plug_fls, NULL, NULL))
+		return NULL;
+	p = (struct kshim_plug *)FlsGetValue(g_plug_fls);
+	if (!p && create) {
+		p = calloc(1, sizeof(*p));
+		if (p && !FlsSetValue(g_plug_fls, p)) {
+			free(p);
+			p = NULL;
+		}
+	}
+	return p;
+}
 
 static int plug_cmp(const void *a, const void *b)
 {
@@ -804,13 +843,16 @@ static int plug_cmp(const void *a, const void *b)
 
 void kshim_unplug(void)
 {
-	struct buffer_head **v = t_plug;
-	size_t n = t_plug_n, i;
+	struct kshim_plug *p = kshim_get_plug(false);
+	struct buffer_head **v;
+	size_t n, i;
 	u8 *bounce;
 
-	if (!n)
+	if (!p || !p->n)
 		return;
-	t_plug_n = 0;   /* end_io callbacks may submit again */
+	v = p->v;
+	n = p->n;
+	p->n = 0;   /* end_io callbacks may submit again */
 	qsort(v, n, sizeof(*v), plug_cmp);
 	bounce = kshim_bounce_alloc(PLUG_BYTES);
 	for (i = 0; i < n;) {
@@ -855,20 +897,27 @@ void submit_bh(unsigned int opf, struct buffer_head *bh)
 	u64 off = (u64)bh->b_blocknr * bh->b_size;
 
 	if ((opf & REQ_OP_MASK) == REQ_OP_WRITE) {
-		if (t_plug_n == t_plug_cap) {
-			size_t nc = t_plug_cap ? t_plug_cap * 2 : 256;
-			struct buffer_head **nv = realloc(t_plug, nc * sizeof(*nv));
+		struct kshim_plug *p = kshim_get_plug(true);
+		if (!p) {
+			err = kshim_bdev_write(bh->b_bdev, off, bh->b_data, bh->b_size);
+			if (bh->b_end_io)
+				bh->b_end_io(bh, err == 0);
+			return;
+		}
+		if (p->n == p->cap) {
+			size_t nc = p->cap ? p->cap * 2 : 256;
+			struct buffer_head **nv = realloc(p->v, nc * sizeof(*nv));
 			if (!nv) {
 				err = kshim_bdev_write(bh->b_bdev, off, bh->b_data, bh->b_size);
 				if (bh->b_end_io)
 					bh->b_end_io(bh, err == 0);
 				return;
 			}
-			t_plug = nv;
-			t_plug_cap = nc;
+			p->v = nv;
+			p->cap = nc;
 		}
-		t_plug[t_plug_n++] = bh;
-		if (t_plug_n >= PLUG_MAX)
+		p->v[p->n++] = bh;
+		if (p->n >= PLUG_MAX)
 			kshim_unplug();
 		return;
 	}
@@ -1214,12 +1263,31 @@ void truncate_inode_pages(struct address_space *m, loff_t start)
 	struct pmap *pm = m->kshim_pages;
 	pgoff_t first = (pgoff_t)((start + PAGE_SIZE - 1) >> PAGE_SHIFT);
 	struct folio *f, *next;
-	size_t i;
+	struct folio **victims = NULL;
+	size_t n = 0, cap = 0, i;
 	if (!pm)
 		return;
 	mutex_lock(&m->kshim_lock);
 	PMAP_FOR_EACH(pm, i, f, next) {
 		if (f->page.index >= first) {
+			if (n == cap) {
+				size_t nc = cap ? cap * 2 : 64;
+				struct folio **nv = realloc(victims, nc * sizeof(*nv));
+				if (!nv)
+					break;
+				victims = nv;
+				cap = nc;
+			}
+			folio_get(f);
+			victims[n++] = f;
+		}
+	}
+	mutex_unlock(&m->kshim_lock);
+	for (i = 0; i < n; i++) {
+		f = victims[i];
+		folio_lock(f);
+		mutex_lock(&m->kshim_lock);
+		if (f->page.mapping == m) {
 			/*
 			 * The driver's ->invalidate_folio is a no-op: buffers already
 			 * in a transaction are written by its commit, so they must
@@ -1228,13 +1296,18 @@ void truncate_inode_pages(struct address_space *m, loff_t start)
 			folio_clear_dirty(f);
 			folio_detach(m, f);
 		}
+		mutex_unlock(&m->kshim_lock);
+		folio_unlock(f);
+		folio_put(f);
 	}
-	mutex_unlock(&m->kshim_lock);
+	free(victims);
 	/* zero the tail of a partial last page */
 	if (start & (PAGE_SIZE - 1)) {
 		struct folio *f = filemap_get_folio(m, (pgoff_t)(start >> PAGE_SHIFT));
 		if (!IS_ERR(f)) {
+			folio_lock(f);
 			folio_zero_segment(f, (size_t)(start & (PAGE_SIZE - 1)), PAGE_SIZE);
+			folio_unlock(f);
 			folio_put(f);
 		}
 	}
@@ -1259,17 +1332,23 @@ void truncate_setsize(struct inode *inode, loff_t newsize)
 void truncate_pagecache_range(struct inode *inode, loff_t start, loff_t end)
 {
 	struct address_space *m = inode->i_mapping;
-	pgoff_t idx;
-	for (idx = (pgoff_t)(start >> PAGE_SHIFT); (loff_t)idx << PAGE_SHIFT <= end; idx++) {
+	pgoff_t idx, last;
+	if (end < start)
+		return;
+	last = (pgoff_t)(end >> PAGE_SHIFT);
+	for (idx = (pgoff_t)(start >> PAGE_SHIFT); ; idx++) {
 		struct folio *f = filemap_get_folio(m, idx);
-		loff_t fs = (loff_t)idx << PAGE_SHIFT;
-		size_t from, to;
-		if (IS_ERR(f))
-			continue;
-		from = start > fs ? (size_t)(start - fs) : 0;
-		to = end + 1 < fs + (loff_t)PAGE_SIZE ? (size_t)(end + 1 - fs) : PAGE_SIZE;
-		folio_zero_segment(f, from, to);
-		folio_put(f);
+		if (!IS_ERR(f)) {
+			loff_t fs = (loff_t)idx << PAGE_SHIFT;
+			size_t from = start > fs ? (size_t)(start - fs) : 0;
+			size_t to = (end - fs) < (loff_t)(PAGE_SIZE - 1) ? (size_t)(end - fs + 1) : PAGE_SIZE;
+			folio_lock(f);
+			folio_zero_segment(f, from, to);
+			folio_unlock(f);
+			folio_put(f);
+		}
+		if (idx == last)
+			break;
 	}
 }
 
@@ -1426,6 +1505,7 @@ void mpage_readahead(struct readahead_control *rac, get_block_t get_block)
 	while ((f = readahead_folio(rac)) != NULL) {
 		if (folio_test_uptodate(f)) {
 			folio_unlock(f);
+			folio_put(f);
 			read_folio_run(batch, n, get_block);
 			n = 0;
 			continue;
@@ -1434,7 +1514,6 @@ void mpage_readahead(struct readahead_control *rac, get_block_t get_block)
 			read_folio_run(batch, n, get_block);
 			n = 0;
 		}
-		folio_get(f);   /* held until filled: readahead_folio returns it without a reference */
 		batch[n++] = f;
 	}
 	read_folio_run(batch, n, get_block);

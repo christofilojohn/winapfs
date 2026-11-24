@@ -999,7 +999,11 @@ private:
 					connected = GetOverlappedResult(h, &ov, &got, FALSE) != 0;
 				}
 				else
+				{
 					CancelIo(h);
+					DWORD got = 0;
+					GetOverlappedResult(h, &ov, &got, TRUE);
+				}
 			}
 			CloseHandle(ov.hEvent);
 			HANDLE next = connected ? NewInstance() : INVALID_HANDLE_VALUE;
@@ -1133,6 +1137,7 @@ const wchar_t *kPipeSddl = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
 SERVICE_STATUS_HANDLE g_status = nullptr;
 SERVICE_STATUS g_ss = {};
 HANDLE g_stop = nullptr, g_rescan = nullptr;
+std::mutex g_mounter_mutex;
 AutoMounter *g_mounter = nullptr;
 
 void ReportStatus(DWORD state, DWORD wait_hint = 0)
@@ -1167,8 +1172,12 @@ DWORD WINAPI Handler(DWORD control, DWORD type, LPVOID data, LPVOID)
 		{
 			auto *h = static_cast<DEV_BROADCAST_HANDLE *>(data);
 			// unmount before answering, so that removal can go ahead
-			if ((type == DBT_DEVICEQUERYREMOVE || type == DBT_DEVICEREMOVEPENDING || type == DBT_DEVICEREMOVECOMPLETE) && g_mounter)
-				g_mounter->ReleaseByNotifyHandle(h->dbch_handle);
+			if (type == DBT_DEVICEQUERYREMOVE || type == DBT_DEVICEREMOVEPENDING || type == DBT_DEVICEREMOVECOMPLETE)
+			{
+				std::lock_guard<std::mutex> lock(g_mounter_mutex);
+				if (g_mounter)
+					g_mounter->ReleaseByNotifyHandle(h->dbch_handle);
+			}
 			else if (type == DBT_DEVICEQUERYREMOVEFAILED)
 				SetEvent(g_rescan);
 		}
@@ -1210,7 +1219,10 @@ void WINAPI ServiceMain(DWORD, LPWSTR *)
 	Config cfg;
 	{
 		AutoMounter m(cfg, {}, g_status);
-		g_mounter = &m;
+		{
+			std::lock_guard<std::mutex> lock(g_mounter_mutex);
+			g_mounter = &m;
+		}
 		{
 			ControlServer control(m, kServicePipe, kPipeSddl);
 			ReportStatus(SERVICE_RUNNING);
@@ -1225,14 +1237,24 @@ void WINAPI ServiceMain(DWORD, LPWSTR *)
 				if (w == WAIT_OBJECT_0 + 1)
 				{
 					// a new disk takes a moment to show its partitions
-					Sleep(1500);
+					if (WaitForSingleObject(g_stop, 1500) == WAIT_OBJECT_0)
+						break;
 					m.Scan();
-					Sleep(3000);
+					if (WaitForSingleObject(g_stop, 3000) == WAIT_OBJECT_0)
+						break;
 				}
 				m.Scan();
 			}
 		}
-		g_mounter = nullptr;
+		if (dn)
+		{
+			UnregisterDeviceNotification(dn);
+			dn = nullptr;
+		}
+		{
+			std::lock_guard<std::mutex> lock(g_mounter_mutex);
+			g_mounter = nullptr;
+		}
 		m.UnmountAll();
 	}
 	if (dn)

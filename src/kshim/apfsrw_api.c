@@ -246,6 +246,9 @@ int apfsrw_open(apfsrw_node *n, bool write, apfsrw_file **out)
 	if (write && sb_rdonly(i->i_sb))
 		return -EROFS;
 	af = calloc(1, sizeof(*af));
+	if (!af)
+		return -ENOMEM;
+	mutex_init(&af->ra_lock);
 	af->f.f_inode = i;
 	af->f.f_mapping = i->i_mapping;
 	af->f.f_op = i->i_fop;
@@ -297,19 +300,22 @@ int apfsrw_read(apfsrw_file *af, uint64_t off, void *buf, size_t len, size_t *go
 	{
 		const u64 window = 4u << 20;
 		u64 from = off, to = off + len;
+		mutex_lock(&af->ra_lock);
 		if (off == af->ra_next)
 			to = max(to, off + window);
 		if (to > size)
 			to = size;
 		if (off < af->ra_end && af->ra_end <= to && off + window >= af->ra_end)
 			from = af->ra_end;   /* the start was read ahead last time */
+		if (from < to)
+			af->ra_end = to;
+		af->ra_next = off + len;
+		mutex_unlock(&af->ra_lock);
 		if (from < to) {
 			pgoff_t first = (pgoff_t)(from >> PAGE_SHIFT);
 			pgoff_t last = (pgoff_t)((to - 1) >> PAGE_SHIFT);
 			kshim_file_readahead(af->f.f_mapping, &af->f, first, (unsigned long)(last - first + 1));
-			af->ra_end = to;
 		}
-		af->ra_next = off + len;
 	}
 
 	while (len > 0) {

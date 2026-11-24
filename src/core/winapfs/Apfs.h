@@ -202,6 +202,7 @@ public:
 	// for the rest of the mount, and GetStat on it reports the new number.
 	virtual bool Writable() const { return false; }
 	virtual bool IoFailed() const { return false; }
+	virtual uint64_t DecompressGen() const { return 0; }
 	virtual int Create(uint64_t parent, const std::string &name, bool dir, uint32_t mode, DirEntry &out) { return -30; }
 	virtual int Symlink(uint64_t parent, const std::string &name, const std::string &target, DirEntry &out) { return -30; }
 	virtual int Link(uint64_t inode, uint64_t parent, const std::string &name) { return -30; }
