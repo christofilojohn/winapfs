@@ -934,6 +934,8 @@ static NTSTATUS Write(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULO
 	}
 	Refresh(self, node);
 	self->FillFileInfo(node->st, node->name, *fi);
+	if (err == -5)   /* -EIO: never mask a fatal device I/O error behind a partial write */
+		return Errno(err);
 	return written ? STATUS_SUCCESS : Errno(err);
 }
 

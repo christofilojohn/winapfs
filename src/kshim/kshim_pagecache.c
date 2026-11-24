@@ -883,6 +883,7 @@ int __sync_dirty_buffer(struct buffer_head *bh, unsigned int op_flags)
 	int err = 0;
 	lock_buffer(bh);
 	if (test_clear_buffer_dirty(bh)) {
+		kshim_unplug();
 		err = kshim_bdev_write(bh->b_bdev, (u64)bh->b_blocknr * bh->b_size, bh->b_data, bh->b_size);
 		if (err) {
 			set_buffer_write_io_error(bh);

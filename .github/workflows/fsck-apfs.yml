@@ -115,9 +115,15 @@ jobs:
               Remove-Item 'build\tests\w3-*.img', 'build\tests\w32-*.img' -Force -ErrorAction SilentlyContinue
             },
             {
-              $conc = 'build\tests\conc-compressed.img'
-              if (-not (Test-Path $conc)) { throw "Missing $conc" }
-              Move-Item $conc 'out\conc-compressed.written.img' -Force
+              foreach ($pair in @(
+                @('conc-compressed.img', 'conc-compressed.written.img'),
+                @('crash-basic.img', 'crash-basic.written.img'),
+                @('full-basic.img', 'full-basic.written.img')
+              )) {
+                $src = Join-Path 'build\tests' $pair[0]
+                if (-not (Test-Path $src)) { throw "Missing $src" }
+                Move-Item $src (Join-Path 'out' $pair[1]) -Force
+              }
               Remove-Item 'build\tests\crash-*.img*', 'build\tests\full-*.img*', 'build\tests\prealloc-*.img', 'build\tests\dirquery-*.img' -Force -ErrorAction SilentlyContinue
             },
             {
@@ -162,7 +168,7 @@ jobs:
         with:
           name: apfs-written-images
 
-      - name: Verify written images with Apple fsck_apfs and read-only mount
+      - name: Verify written images with Apple fsck_apfs, full-tree read, and macOS RW round-trip
         shell: bash
         run: |
           set -euo pipefail
@@ -176,10 +182,9 @@ jobs:
           mkdir -p written
           tar -xzf apfs-written-images.tar.gz -C written
 
-          for img in written/*.written.img; do
-            echo "========================================"
-            echo "Checking $img with Apple fsck_apfs -n -l"
-            echo "========================================"
+          run_fsck() {
+            local img="$1"
+            local out
             out=$(hdiutil attach -nomount -readonly -imagekey diskimage-class=CRawDiskImage "$img")
             echo "$out"
             DISK=$(awk '$2 == "GUID_partition_scheme" {print $1; exit}' <<<"$out")
@@ -190,19 +195,43 @@ jobs:
             echo "Container device: $CONT (disk: $DISK)"
             fsck_apfs -n -l "$CONT"
             hdiutil detach -quiet "$DISK"; DISK=""
+          }
 
-            echo "Verifying macOS read-only mount of $img"
+          for img in written/*.written.img; do
+            echo "========================================"
+            echo "1) Apple fsck_apfs -n -l (pre-roundtrip): $img"
+            echo "========================================"
+            run_fsck "$img"
+
+            echo "2) macOS read-write mount, full-tree checksum read, and RW round-trip: $img"
             mnt="$WORK/mnt-$(basename "$img" .written.img)"
             mkdir -p "$mnt"
-            out=$(hdiutil attach -nobrowse -readonly -mountroot "$mnt" -imagekey diskimage-class=CRawDiskImage "$img")
+            out=$(hdiutil attach -nobrowse -readwrite -mountroot "$mnt" -imagekey diskimage-class=CRawDiskImage "$img")
             DISK=$(awk '$2 == "GUID_partition_scheme" {print $1; exit}' <<<"$out")
             [[ -n "$DISK" ]] || DISK=$(awk 'NR==1{print $1}' <<<"$out")
             vol_dirs=$(find "$mnt" -mindepth 1 -maxdepth 1 -type d)
-            [[ -n "$vol_dirs" ]] || { echo "ERROR: Failed to mount $img on macOS"; exit 1; }
+            [[ -n "$vol_dirs" ]] || { echo "ERROR: Failed to mount $img read-write on macOS"; exit 1; }
             while IFS= read -r vol_dir; do
-              echo "Mounted $(basename "$vol_dir"):"
-              ls -la "$vol_dir" | head -n 20
+              file_count=$(find "$vol_dir" -not -path '*/.Trashes*' -not -path '*/.fseventsd*' -not -path '*/.Spotlight-V100*' -type f | wc -l | tr -d ' ')
+              echo "Reading all $file_count regular files in $(basename "$vol_dir")..."
+              find "$vol_dir" -not -path '*/.Trashes*' -not -path '*/.fseventsd*' -not -path '*/.Spotlight-V100*' -type f -print0 | xargs -0 shasum -a 256 </dev/null >/dev/null
+
+              rt="$vol_dir/.macos-rt"
+              mkdir -p "$rt"
+              head -c 16384 /dev/urandom > "$rt/blob.bin"
+              want=$(shasum -a 256 "$rt/blob.bin" | awk '{print $1}')
+              printf 'winapfs-macos-roundtrip\n' > "$rt/note.txt"
+              mv "$rt/note.txt" "$rt/note-renamed.txt"
+              printf 'appended\n' >> "$rt/note-renamed.txt"
+              got=$(shasum -a 256 "$rt/blob.bin" | awk '{print $1}')
+              [[ "$want" == "$got" ]] || { echo "ERROR: macOS round-trip SHA-256 mismatch on $vol_dir"; exit 1; }
+              rm -f "$rt/blob.bin"
+              echo "macOS RW round-trip OK in $(basename "$vol_dir")"
             done <<<"$vol_dirs"
+            sync
             hdiutil detach -quiet "$DISK"; DISK=""
+
+            echo "3) Apple fsck_apfs -n -l (post-roundtrip): $img"
+            run_fsck "$img"
           done
-          echo "All winapfs-written APFS images passed Apple fsck_apfs and mounted cleanly on macOS."
+          echo "All winapfs-written APFS images passed full-tree read, macOS RW round-trip, and double Apple fsck_apfs!"
