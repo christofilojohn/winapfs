@@ -38,4 +38,10 @@ target_include_directories(winapfs SYSTEM PRIVATE ${WINFSP_INCLUDE_DIR})
 target_link_libraries(winapfs PRIVATE winapfs_core ${WINFSP_LIBRARY} delayimp dbghelp setupapi cfgmgr32 winmm)
 target_link_options(winapfs PRIVATE /ENTRY:wmainCRTStartup /DELAYLOAD:winfsp-x64.dll)
 target_compile_options(winapfs PRIVATE /W4 /wd4100)
+# The service's "verify" command runs winapfs-fsck.exe from winapfs.exe's own
+# folder only (as installed), so put a copy there in the build tree too.
+add_dependencies(winapfs winapfs-fsck)
+add_custom_command(TARGET winapfs POST_BUILD
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:winapfs-fsck> $<TARGET_FILE_DIR:winapfs>
+	COMMENT "copy winapfs-fsck.exe next to winapfs.exe")
 install(TARGETS winapfs RUNTIME DESTINATION bin)

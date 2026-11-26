@@ -549,18 +549,13 @@ public:
 		std::wstring exe_dir(exe_buf, fn);
 		size_t slash = exe_dir.rfind(L'\\');
 		exe_dir = (slash == std::wstring::npos) ? L"" : exe_dir.substr(0, slash + 1);
+		// Only ever next to winapfs.exe: the service runs as SYSTEM, and any
+		// path relative to it outside the install folder (e.g. ..\..\ from
+		// Program Files resolves under C:\) may be user-writable. The build
+		// copies winapfs-fsck.exe next to winapfs.exe (src/mount/CMakeLists.txt).
 		std::wstring fsck_path = exe_dir + L"winapfs-fsck.exe";
 		if (GetFileAttributesW(fsck_path.c_str()) == INVALID_FILE_ATTRIBUTES)
-		{
-			std::wstring alt_rel = exe_dir + L"..\\..\\fsck\\Release\\winapfs-fsck.exe";
-			std::wstring alt_dbg = exe_dir + L"..\\..\\fsck\\Debug\\winapfs-fsck.exe";
-			if (GetFileAttributesW(alt_rel.c_str()) != INVALID_FILE_ATTRIBUTES)
-				fsck_path = alt_rel;
-			else if (GetFileAttributesW(alt_dbg.c_str()) != INVALID_FILE_ATTRIBUTES)
-				fsck_path = alt_dbg;
-			else
-				return "winapfs-fsck.exe not found";
-		}
+			return "winapfs-fsck.exe not found";
 
 		SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
 		HANDLE rd = nullptr, wr = nullptr;
