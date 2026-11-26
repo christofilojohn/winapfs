@@ -18,7 +18,7 @@ namespace winapfs {
 namespace {
 
 constexpr const wchar_t *kApiHost = L"api.github.com";
-constexpr const wchar_t *kLatestPath = L"/repos/FOLKGG/winapfs/releases/latest";
+constexpr const wchar_t *kLatestPath = L"/repos/christofilojohn/winapfs/releases/latest";
 constexpr size_t kMaxApiJsonBytes = 2u * 1024u * 1024u;
 constexpr uint64_t kMinInstallerBytes = 64u * 1024u;
 constexpr uint64_t kMaxInstallerBytes = 100u * 1024u * 1024u;
@@ -85,9 +85,14 @@ std::array<unsigned long, 3> ParseVersionTuple(const std::string &raw)
 	return out;
 }
 
+// Only this repository's own release assets. browser_download_url is always
+// github.com/<owner>/<repo>/releases/download/...; GitHub then redirects
+// (HTTPS only, see the redirect policy) to its asset CDN.
+constexpr const char *kTrustedDownloadPrefix = "https://github.com/christofilojohn/winapfs/releases/download/";
+
 bool IsTrustedDownloadUrl(const std::string &url)
 {
-	return StartsWith(url, "https://github.com/") || StartsWith(url, "https://objects.githubusercontent.com/");
+	return StartsWith(url, kTrustedDownloadPrefix) && url.find("..") == std::string::npos;
 }
 
 std::wstring SanitizeAssetName(const std::string &asset_name)
@@ -173,7 +178,7 @@ UpdateInfo CheckForUpdates(const std::string &current_version)
 		info.ok = true;
 		info.update_available = false;
 		info.latest_version = current_version;
-		info.release_url = "https://github.com/FOLKGG/winapfs/releases";
+		info.release_url = "https://github.com/christofilojohn/winapfs/releases";
 		return info;
 	}
 	if (status != 200)
@@ -223,7 +228,7 @@ UpdateInfo CheckForUpdates(const std::string &current_version)
 	if (doc.contains("html_url") && doc["html_url"].is_string())
 		info.release_url = doc["html_url"].get<std::string>();
 	else
-		info.release_url = "https://github.com/FOLKGG/winapfs/releases";
+		info.release_url = "https://github.com/christofilojohn/winapfs/releases";
 
 	std::string setup_url, setup_name;
 	std::string msi_url, msi_name;

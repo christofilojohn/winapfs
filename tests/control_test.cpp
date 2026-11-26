@@ -59,12 +59,18 @@ int main()
 	std::string err;
 	Check(!DownloadUpdateInstaller("", "winapfs-0.7.5-x64-setup.exe", out_path, err),
 		"DownloadUpdateInstaller rejects empty URL");
-	Check(!DownloadUpdateInstaller("http://github.com/FOLKGG/winapfs/releases/download/v0.7.5/winapfs-0.7.5-x64-setup.exe",
+	Check(!DownloadUpdateInstaller("http://github.com/christofilojohn/winapfs/releases/download/v0.7.5/winapfs-0.7.5-x64-setup.exe",
 		"winapfs-0.7.5-x64-setup.exe", out_path, err),
 		"DownloadUpdateInstaller rejects non-HTTPS URL");
 	Check(!DownloadUpdateInstaller("https://evil.example.com/winapfs-0.7.5-x64-setup.exe",
 		"winapfs-0.7.5-x64-setup.exe", out_path, err),
 		"DownloadUpdateInstaller rejects untrusted HTTPS host");
+	Check(!DownloadUpdateInstaller("https://github.com/someone-else/winapfs/releases/download/v0.7.5/winapfs-0.7.5-x64-setup.exe",
+		"winapfs-0.7.5-x64-setup.exe", out_path, err),
+		"DownloadUpdateInstaller rejects another repository's release");
+	Check(!DownloadUpdateInstaller("https://objects.githubusercontent.com/winapfs-0.7.5-x64-setup.exe",
+		"winapfs-0.7.5-x64-setup.exe", out_path, err),
+		"DownloadUpdateInstaller rejects a bare CDN URL");
 
 	std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "control_test: OK", g_fail);
 	return g_fail ? 1 : 0;

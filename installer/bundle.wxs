@@ -17,7 +17,7 @@
           Version="$(var.Version)"
           UpgradeCode="A91B4C6D-2E8F-4F31-9A7B-3D5E1C8B2F04"
           IconSourceFile="$(sys.SOURCEFILEDIR)..\assets\winapfs.ico"
-          AboutUrl="https://github.com/FOLKGG/winapfs">
+          AboutUrl="https://github.com/christofilojohn/winapfs">
 
     <bal:Condition Condition="VersionNT &gt;= v10.0 AND VersionNT64"
                    Message="winapfs requires 64-bit Windows 10 or Windows 11." />

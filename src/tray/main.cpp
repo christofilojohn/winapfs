@@ -863,7 +863,7 @@ void ActionInstallService()
 
 void ActionOpenReleasePage()
 {
-	std::string url = !g_update.release_url.empty() ? g_update.release_url : "https://github.com/FOLKGG/winapfs/releases";
+	std::string url = !g_update.release_url.empty() ? g_update.release_url : "https://github.com/christofilojohn/winapfs/releases";
 	ShellExecuteW(nullptr, L"open", W(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 

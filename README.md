@@ -10,9 +10,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/FOLKGG/winapfs/releases"><img alt="Release" src="https://img.shields.io/github/v/release/FOLKGG/winapfs?include_prereleases&label=release"></a>
-  <a href="https://github.com/FOLKGG/winapfs/actions/workflows/build.yml"><img alt="Build Windows" src="https://github.com/FOLKGG/winapfs/actions/workflows/build.yml/badge.svg"></a>
-  <a href="https://github.com/FOLKGG/winapfs/actions/workflows/fsck-apfs.yml"><img alt="macOS fsck_apfs" src="https://github.com/FOLKGG/winapfs/actions/workflows/fsck-apfs.yml/badge.svg"></a>
+  <a href="https://github.com/christofilojohn/winapfs/releases"><img alt="Release" src="https://img.shields.io/github/v/release/christofilojohn/winapfs?include_prereleases&label=release"></a>
+  <a href="https://github.com/christofilojohn/winapfs/actions/workflows/build.yml"><img alt="Build Windows" src="https://github.com/christofilojohn/winapfs/actions/workflows/build.yml/badge.svg"></a>
+  <a href="https://github.com/christofilojohn/winapfs/actions/workflows/fsck-apfs.yml"><img alt="macOS fsck_apfs" src="https://github.com/christofilojohn/winapfs/actions/workflows/fsck-apfs.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="Licence: GPL-2.0" src="https://img.shields.io/badge/licence-GPL--2.0-blue"></a>
   <img alt="Windows 10/11 x64" src="https://img.shields.io/badge/Windows-10%20%7C%2011%20x64-0078d4">
   <img alt="Status: beta" src="https://img.shields.io/badge/status-beta-orange">
@@ -84,7 +84,7 @@ no driver signing, nothing proprietary.
 
 ## Install
 
-Download builds from [Releases](https://github.com/FOLKGG/winapfs/releases) (or the latest build artifacts from [GitHub Actions](https://github.com/FOLKGG/winapfs/actions/workflows/build.yml)):
+Download builds from [Releases](https://github.com/christofilojohn/winapfs/releases) (or the latest build artifacts from [GitHub Actions](https://github.com/christofilojohn/winapfs/actions/workflows/build.yml)):
 
 * **All-in-one installer (recommended):** download **`winapfs-<version>-x64-setup.exe`** (`winapfs-setup-x64` artifact) and run it. It installs **WinFsp 2.2** and **winapfs** in one step (uninstalling winapfs later leaves WinFsp intact).
 * **Standalone MSI** (if you already have **[WinFsp](https://winfsp.dev/rel/)** 2.x installed): download and run **`winapfs-<version>-x64.msi`** (`winapfs-msi-x64` artifact).
@@ -231,9 +231,7 @@ expected checksums.
 
 ## Credits
 
-This repository is a maintained fork of
-[christofilojohn/winapfs](https://github.com/christofilojohn/winapfs). winapfs
-stands on the work of these projects. Thank you.
+winapfs stands on the work of these projects. Thank you.
 
 | Project | Used for | Licence |
 |---|---|---|
