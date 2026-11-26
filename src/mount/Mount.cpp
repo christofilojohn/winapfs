@@ -6,10 +6,28 @@
 
 #include <ApfsLib/Util.h>
 
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
 #include <cstdarg>
 #include <cstdio>
 
 namespace winapfs {
+
+static void SecureClear(std::string &s)
+{
+	if (!s.empty())
+	{
+		SecureZeroMemory(&s[0], s.size());
+		s.clear();
+	}
+}
+
+struct SecretStringGuard
+{
+	std::string &s;
+	~SecretStringGuard() { SecureClear(s); }
+};
 
 const char *const kWinFspNotice =
 	"WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos\n"
@@ -59,6 +77,7 @@ std::string MountEnvName(const std::string &vol)
 std::unique_ptr<Volume> OpenVolume(Container &c, const VolumeInfo &vi, const OpenOptions &o)
 {
 	std::string pw = o.password;
+	SecretStringGuard pw_guard{ pw };
 	std::string err;
 
 	if (o.rw)
@@ -155,7 +174,7 @@ std::unique_ptr<Volume> OpenVolume(Container &c, const VolumeInfo &vi, const Ope
 		if (!vi.encrypted || !o.ask)
 			break;
 		fprintf(stderr, "%s\n", err.c_str());
-		pw.clear();
+		SecureClear(pw);
 	}
 	Log(0, "%s: %s", vi.name.c_str(), err.c_str());
 	return nullptr;

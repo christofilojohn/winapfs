@@ -270,7 +270,7 @@ int apfsrw_rename(apfsrw_node *olddir_node, const char *oldname, size_t oldlen,
 			err = -EISDIR;
 		else if (S_ISDIR(src->i_mode) && odi != ndi && is_ancestor(src, ndi))
 			err = -EINVAL;	/* into its own subtree */
-		else if (tgt == src)
+		else if (tgt == src && (odi != ndi || apfs_filename_cmp(odi->i_sb, oldname, (unsigned int)oldlen, newname, (unsigned int)newlen) != 0))
 			noop = true;	/* another link to the same inode (POSIX: no-op) */
 	}
 	/*
@@ -347,7 +347,7 @@ int apfsrw_write(apfsrw_file *af, uint64_t off, const void *buf, size_t len, siz
 		*written += (size_t)status;
 	}
 	inode_unlock(inode);
-	return *written ? 0 : err;
+	return err;
 }
 
 int apfsrw_fsync(apfsrw_file *af)
@@ -495,7 +495,7 @@ int apfsrw_removexattr(apfsrw_node *n, const char *name)
  */
 int apfsrw_decompress(apfsrw_node *dir, const char *name, size_t len, apfsrw_node **out)
 {
-	enum { CHUNK = 1 << 20 };
+	enum { CHUNK = 4 << 20 };
 	apfsrw_node *src = NULL, *tmp = NULL;
 	apfsrw_file *in = NULL, *outf = NULL;
 	apfsrw_stat st;

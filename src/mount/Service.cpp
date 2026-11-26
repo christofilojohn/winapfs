@@ -40,6 +40,9 @@
 #include <setupapi.h>
 #include <winioctl.h>
 
+#include <algorithm>
+#include <cctype>
+#include <condition_variable>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -52,6 +55,21 @@
 using namespace winapfs;
 
 namespace {
+
+void SecureClear(std::string &s)
+{
+	if (!s.empty())
+	{
+		SecureZeroMemory(&s[0], s.size());
+		s.clear();
+	}
+}
+
+struct SecretStringGuard
+{
+	std::string &s;
+	~SecretStringGuard() { SecureClear(s); }
+};
 
 const wchar_t *kServiceName = L"winapfs";
 const wchar_t *kDisplayName = L"winapfs (APFS for Windows)";
@@ -310,13 +328,22 @@ public:
 			{
 				const VolStatus &s = kv.second;
 				std::string letter = "-", mode = "-";
+				uint64_t rbytes = 0, wbytes = 0;
+				bool io_failed = false;
 				for (const auto &m : d->mounts)
 					if (m.uuid == kv.first)
 					{
 						letter = WideToUtf8(m.fs->MountPoint());
 						mode = m.fs->Vol().Writable() ? "rw" : "ro";
+						rbytes = m.fs->ReadBytes();
+						wbytes = m.fs->WriteBytes();
+						io_failed = m.fs->Vol().IoFailed();
 					}
-				out.push_back("vol\t" + kv.first + "\t" + Clean(s.name) + "\t" + s.state + "\t" + letter + "\t" + mode + "\t" + d->path + "\t" + Clean(s.note));
+				bool hide = m_cfg.Dword(VolKey(kv.first), L"HideDotfiles", m_cfg.Dword(L"", L"HideDotfiles", 1)) != 0;
+				std::string note = io_failed ? "I/O error: writes blocked; unmount/eject and check disk" : s.note;
+				out.push_back("vol\t" + kv.first + "\t" + Clean(s.name) + "\t" + s.state + "\t" + letter + "\t" + mode + "\t" +
+					d->path + "\t" + Clean(note) + "\t" + (hide ? "1" : "0") + "\t" +
+					std::to_string(rbytes) + "\t" + std::to_string(wbytes));
 			}
 		out.push_back("cfg\tAllowDiskWrites\t" + std::to_string(m_cfg.Dword(L"", L"AllowDiskWrites", 0)));
 		return out;
@@ -405,6 +432,44 @@ public:
 	std::string Set(const std::string &uuid, const std::string &key, const std::string &value)
 	{
 		std::wstring wkey = Utf8ToWide(key);
+		if (key == "DriveLetter")
+		{
+			if (value.size() != 2 || !std::isalpha(static_cast<unsigned char>(value[0])) || value[1] != ':')
+				return "the drive letter must be like X:";
+			wchar_t letter = static_cast<wchar_t>(std::toupper(static_cast<unsigned char>(value[0])));
+			if (letter < L'D' || letter > L'Z')
+				return "the drive letter must be between D: and Z:";
+			std::wstring wval({ letter, L':' });
+			bool remount = false;
+			{
+				std::lock_guard<std::mutex> lock(m_mutex);
+				Disk *d = nullptr;
+				VolStatus *s = Find(uuid, &d);
+				if (!s)
+					return "no such volume";
+				std::wstring cur_mp;
+				bool encrypted = false;
+				for (const auto &m : d->mounts)
+					if (m.uuid == uuid)
+					{
+						cur_mp = m.fs->MountPoint();
+						encrypted = m.fs->Vol().Info().encrypted;
+					}
+				if (_wcsicmp(cur_mp.c_str(), wval.c_str()) != 0 && !LetterFree(letter))
+					return "drive letter is already in use";
+				if (!m_cfg.SetString(VolKey(uuid), L"DriveLetter", wval))
+					return "cannot store the setting";
+				if (!cur_mp.empty() && !encrypted && _wcsicmp(cur_mp.c_str(), wval.c_str()) != 0)
+				{
+					Stop(*d, uuid);
+					s->tried = false;
+					remount = true;
+				}
+			}
+			if (remount)
+				Scan();
+			return "";
+		}
 		if (key != "ReadWrite" && key != "Disabled" && key != "HideDotfiles")
 			return "unknown setting " + key;
 		if (value != "0" && value != "1")
@@ -419,6 +484,10 @@ public:
 			if (!m_cfg.SetDword(VolKey(uuid), wkey.c_str(), value == "1"))
 				return "cannot store the setting";
 			bool mounted = IsMounted(*d, uuid);
+			bool encrypted = false;
+			for (const auto &m : d->mounts)
+				if (m.uuid == uuid)
+					encrypted = m.fs->Vol().Info().encrypted;
 			if (key == "Disabled" && value == "1")
 			{
 				Stop(*d, uuid);
@@ -437,7 +506,7 @@ public:
 				StopPartition(*d, s->part);
 				remount = true;
 			}
-			else if (mounted)
+			else if (mounted && !encrypted)
 			{
 				Stop(*d, uuid);     // applies HideDotfiles
 				s->tried = false;
@@ -446,6 +515,129 @@ public:
 		}
 		if (remount)
 			Scan();
+		return "";
+	}
+
+	std::string Verify(const std::string &uuid, std::string &out_lines)
+	{
+		out_lines.clear();
+		std::string path;
+		int part = -1;
+		bool has_rw = false;
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			Disk *d = nullptr;
+			VolStatus *s = Find(uuid, &d);
+			if (!s)
+				return "no such volume";
+			for (const auto &m : d->mounts)
+				if (m.fs->Vol().Writable())
+				{
+					has_rw = true;
+					m.fs->Vol().Sync();
+				}
+			path = d->path;
+			part = s->part;
+		}
+		if (path.empty() || path.find('"') != std::string::npos)
+			return "invalid disk path";
+
+		wchar_t exe_buf[MAX_PATH];
+		DWORD fn = GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
+		if (!fn || fn >= MAX_PATH)
+			return "cannot locate winapfs.exe";
+		std::wstring exe_dir(exe_buf, fn);
+		size_t slash = exe_dir.rfind(L'\\');
+		exe_dir = (slash == std::wstring::npos) ? L"" : exe_dir.substr(0, slash + 1);
+		std::wstring fsck_path = exe_dir + L"winapfs-fsck.exe";
+		if (GetFileAttributesW(fsck_path.c_str()) == INVALID_FILE_ATTRIBUTES)
+		{
+			std::wstring alt_rel = exe_dir + L"..\\..\\fsck\\Release\\winapfs-fsck.exe";
+			std::wstring alt_dbg = exe_dir + L"..\\..\\fsck\\Debug\\winapfs-fsck.exe";
+			if (GetFileAttributesW(alt_rel.c_str()) != INVALID_FILE_ATTRIBUTES)
+				fsck_path = alt_rel;
+			else if (GetFileAttributesW(alt_dbg.c_str()) != INVALID_FILE_ATTRIBUTES)
+				fsck_path = alt_dbg;
+			else
+				return "winapfs-fsck.exe not found";
+		}
+
+		SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+		HANDLE rd = nullptr, wr = nullptr;
+		if (!CreatePipe(&rd, &wr, &sa, 0))
+			return "cannot create output pipe";
+		SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+		std::wstring cmd = L"\"" + fsck_path + L"\"";
+		if (!has_rw)
+			cmd += L" -c";
+		if (part >= 0)
+			cmd += L" --partition " + std::to_wstring(part);
+		cmd += L" \"" + Utf8ToWide(path) + L"\"";
+
+		STARTUPINFOW si = { sizeof(si) };
+		si.dwFlags = STARTF_USESTDHANDLES;
+		si.hStdInput = INVALID_HANDLE_VALUE;
+		si.hStdOutput = wr;
+		si.hStdError = wr;
+		PROCESS_INFORMATION pi = {};
+		BOOL ok = CreateProcessW(fsck_path.c_str(), &cmd[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+		CloseHandle(wr);
+		if (!ok)
+		{
+			DWORD e = GetLastError();
+			CloseHandle(rd);
+			return "cannot run winapfs-fsck.exe (error " + std::to_string(e) + ")";
+		}
+
+		std::string captured;
+		std::thread reader([rd, &captured] {
+			char buf[1024];
+			DWORD got = 0;
+			while (ReadFile(rd, buf, sizeof(buf), &got, nullptr) && got > 0)
+			{
+				if (captured.size() < 16384)
+				{
+					size_t take = (std::min)(static_cast<size_t>(got), 16384 - captured.size());
+					captured.append(buf, take);
+				}
+			}
+			CloseHandle(rd);
+		});
+
+		DWORD wait_rc = WaitForSingleObject(pi.hProcess, 60000);
+		DWORD exit_code = 1;
+		if (wait_rc != WAIT_OBJECT_0)
+		{
+			TerminateProcess(pi.hProcess, 1);
+			WaitForSingleObject(pi.hProcess, 5000);
+			CloseHandle(pi.hThread);
+			CloseHandle(pi.hProcess);
+			reader.join();
+			return "winapfs-fsck timed out";
+		}
+		GetExitCodeProcess(pi.hProcess, &exit_code);
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+		reader.join();
+
+		out_lines = "exit\t" + std::to_string(exit_code) + "\n";
+		size_t pos = 0;
+		int kept = 0;
+		while (pos < captured.size() && kept < 40)
+		{
+			size_t nl = captured.find('\n', pos);
+			if (nl == std::string::npos)
+				nl = captured.size();
+			std::string line = captured.substr(pos, nl - pos);
+			pos = nl + 1;
+			while (!line.empty() && line.back() == '\r')
+				line.pop_back();
+			if (line.empty())
+				continue;
+			out_lines += Clean(std::move(line)) + "\n";
+			kept++;
+		}
 		return "";
 	}
 
@@ -513,6 +705,11 @@ private:
 				d.mounts[i].fs->Stop();
 				Log(2, "unmounted %s (%ls)", d.mounts[i].name.c_str(), mp.c_str());
 				d.mounts.erase(d.mounts.begin() + static_cast<ptrdiff_t>(i));
+				if (d.mounts.empty())
+				{
+					d.containers.clear();
+					d.locks.clear();
+				}
 				return;
 			}
 	}
@@ -528,6 +725,11 @@ private:
 				if (kv.second.state == "mounted")
 					kv.second.tried = false;
 			}
+		if (d.mounts.empty())
+		{
+			d.containers.clear();
+			d.locks.clear();
+		}
 	}
 
 	void Drop(size_t i)
@@ -655,6 +857,7 @@ private:
 		o.allow_disk_writes = m_cfg.Dword(L"", L"AllowDiskWrites", 0) != 0;
 		o.locks = &disk.locks;
 		o.password = password;
+		SecretStringGuard pw_guard{ o.password };
 		std::unique_ptr<Volume> vol;
 		std::string rw_problem;
 		if (rw && !vi.encrypted)
@@ -758,6 +961,8 @@ public:
 		SetEvent(m_stop);
 		if (m_thread.joinable())
 			m_thread.join();
+		std::unique_lock<std::mutex> lock(m_workers_mutex);
+		m_workers_cv.wait(lock, [this] { return m_active_workers == 0; });
 		CloseHandle(m_stop);
 		if (m_sd)
 			LocalFree(m_sd);
@@ -794,14 +999,34 @@ private:
 					connected = GetOverlappedResult(h, &ov, &got, FALSE) != 0;
 				}
 				else
+				{
 					CancelIo(h);
+					DWORD got = 0;
+					GetOverlappedResult(h, &ov, &got, TRUE);
+				}
 			}
 			CloseHandle(ov.hEvent);
 			HANDLE next = connected ? NewInstance() : INVALID_HANDLE_VALUE;
 			if (connected)
-				Serve(h);
-			DisconnectNamedPipe(h);
-			CloseHandle(h);
+			{
+				{
+					std::lock_guard<std::mutex> lock(m_workers_mutex);
+					m_active_workers++;
+				}
+				std::thread([this, h] {
+					Serve(h);
+					DisconnectNamedPipe(h);
+					CloseHandle(h);
+					std::lock_guard<std::mutex> lock(m_workers_mutex);
+					if (--m_active_workers == 0)
+						m_workers_cv.notify_all();
+				}).detach();
+			}
+			else
+			{
+				DisconnectNamedPipe(h);
+				CloseHandle(h);
+			}
 			h = next;
 		}
 		if (h != INVALID_HANDLE_VALUE)
@@ -810,10 +1035,14 @@ private:
 
 	void Serve(HANDLE h)
 	{
+		constexpr size_t kMaxRequestBytes = 65536;
 		std::string req;
 		char buf[4096];
 		OVERLAPPED ov = {};
 		ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		if (!ov.hEvent)
+			return;
+		bool too_large = false;
 		for (;;)
 		{
 			DWORD got = 0;
@@ -824,18 +1053,36 @@ private:
 				ok = GetOverlappedResult(h, &ov, &got, TRUE);
 				e = ok ? 0 : GetLastError();
 			}
+			if (got > kMaxRequestBytes || req.size() > kMaxRequestBytes - got)
+			{
+				too_large = true;
+				break;
+			}
 			req.append(buf, got);
 			if (ok)
 				break;
 			if (e != ERROR_MORE_DATA)   // the rest of a longer message follows
 			{
+				SecureZeroMemory(buf, sizeof(buf));
+				SecureClear(req);
 				CloseHandle(ov.hEvent);
 				return;
 			}
 		}
-		while (!req.empty() && (req.back() == '\n' || req.back() == '\r'))
-			req.pop_back();
-		std::string resp = Handle(req);
+		SecureZeroMemory(buf, sizeof(buf));
+		std::string resp;
+		if (too_large)
+		{
+			SecureClear(req);
+			resp = "ERR request too large";
+		}
+		else
+		{
+			while (!req.empty() && (req.back() == '\n' || req.back() == '\r'))
+				req.pop_back();
+			resp = Handle(req);
+			SecureClear(req);
+		}
 		DWORD done = 0;
 		if (!WriteFile(h, resp.data(), static_cast<DWORD>(resp.size()), nullptr, &ov) && GetLastError() == ERROR_IO_PENDING)
 			GetOverlappedResult(h, &ov, &done, TRUE);
@@ -859,12 +1106,16 @@ private:
 			err = m_mounter.Unmount(f[1]);
 		else if (cmd == "eject" && f.size() >= 2)
 			err = m_mounter.Eject(f[1]);
+		else if (cmd == "verify" && f.size() >= 2)
+			err = m_mounter.Verify(f[1], out);
 		else if (cmd == "set" && f.size() >= 4)
 			err = m_mounter.Set(f[1], f[2], f[3]);
 		else if (cmd == "rescan")
 			m_mounter.Scan();
 		else
 			err = "unknown request";
+		for (auto &part : f)
+			SecureClear(part);
 		return out + (err.empty() ? "OK" : "ERR " + err);
 	}
 
@@ -873,6 +1124,9 @@ private:
 	PSECURITY_DESCRIPTOR m_sd = nullptr;
 	HANDLE m_stop = nullptr;
 	std::thread m_thread;
+	std::mutex m_workers_mutex;
+	std::condition_variable m_workers_cv;
+	int m_active_workers = 0;
 };
 
 // interactive users may use the pipe; SYSTEM and administrators fully
@@ -883,6 +1137,7 @@ const wchar_t *kPipeSddl = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
 SERVICE_STATUS_HANDLE g_status = nullptr;
 SERVICE_STATUS g_ss = {};
 HANDLE g_stop = nullptr, g_rescan = nullptr;
+std::mutex g_mounter_mutex;
 AutoMounter *g_mounter = nullptr;
 
 void ReportStatus(DWORD state, DWORD wait_hint = 0)
@@ -917,8 +1172,12 @@ DWORD WINAPI Handler(DWORD control, DWORD type, LPVOID data, LPVOID)
 		{
 			auto *h = static_cast<DEV_BROADCAST_HANDLE *>(data);
 			// unmount before answering, so that removal can go ahead
-			if ((type == DBT_DEVICEQUERYREMOVE || type == DBT_DEVICEREMOVEPENDING || type == DBT_DEVICEREMOVECOMPLETE) && g_mounter)
-				g_mounter->ReleaseByNotifyHandle(h->dbch_handle);
+			if (type == DBT_DEVICEQUERYREMOVE || type == DBT_DEVICEREMOVEPENDING || type == DBT_DEVICEREMOVECOMPLETE)
+			{
+				std::lock_guard<std::mutex> lock(g_mounter_mutex);
+				if (g_mounter)
+					g_mounter->ReleaseByNotifyHandle(h->dbch_handle);
+			}
 			else if (type == DBT_DEVICEQUERYREMOVEFAILED)
 				SetEvent(g_rescan);
 		}
@@ -960,7 +1219,10 @@ void WINAPI ServiceMain(DWORD, LPWSTR *)
 	Config cfg;
 	{
 		AutoMounter m(cfg, {}, g_status);
-		g_mounter = &m;
+		{
+			std::lock_guard<std::mutex> lock(g_mounter_mutex);
+			g_mounter = &m;
+		}
 		{
 			ControlServer control(m, kServicePipe, kPipeSddl);
 			ReportStatus(SERVICE_RUNNING);
@@ -975,14 +1237,24 @@ void WINAPI ServiceMain(DWORD, LPWSTR *)
 				if (w == WAIT_OBJECT_0 + 1)
 				{
 					// a new disk takes a moment to show its partitions
-					Sleep(1500);
+					if (WaitForSingleObject(g_stop, 1500) == WAIT_OBJECT_0)
+						break;
 					m.Scan();
-					Sleep(3000);
+					if (WaitForSingleObject(g_stop, 3000) == WAIT_OBJECT_0)
+						break;
 				}
 				m.Scan();
 			}
 		}
-		g_mounter = nullptr;
+		if (dn)
+		{
+			UnregisterDeviceNotification(dn);
+			dn = nullptr;
+		}
+		{
+			std::lock_guard<std::mutex> lock(g_mounter_mutex);
+			g_mounter = nullptr;
+		}
 		m.UnmountAll();
 	}
 	if (dn)
@@ -1301,7 +1573,9 @@ int CmdCtl(const std::vector<std::wstring> &args)
 			"       winapfs ctl mount <volume> [--password <pw>]\n"
 			"       winapfs ctl unmount <volume>\n"
 			"       winapfs ctl eject <volume>        unmount the disk's volumes and eject it\n"
+			"       winapfs ctl verify <volume>       check the APFS container (winapfs-fsck -c)\n"
 			"       winapfs ctl set <volume> <ReadWrite|Disabled|HideDotfiles> <0|1>\n"
+			"       winapfs ctl set <volume> DriveLetter <X:>\n"
 			"       winapfs ctl rescan\n"
 			"<volume>: a name or UUID from `winapfs ctl list`. Talks to the service\n"
 			"(WINAPFS_PIPE selects another pipe, e.g. service debug's).\n");
@@ -1346,8 +1620,29 @@ int CmdCtl(const std::vector<std::wstring> &args)
 	}
 	std::string want = WideToUtf8(args[1]), uuid;
 	for (const auto &v : vols)
-		if (v.uuid == want || v.name == want)
+	{
+		if (v.uuid == want)
+		{
 			uuid = v.uuid;
+			break;
+		}
+	}
+	if (uuid.empty())
+	{
+		std::vector<const VolumeStatus *> matches;
+		for (const auto &v : vols)
+			if (v.name == want)
+				matches.push_back(&v);
+		if (matches.size() == 1)
+			uuid = matches[0]->uuid;
+		else if (matches.size() > 1)
+		{
+			fprintf(stderr, "multiple volumes named '%s'; specify its UUID:\n", want.c_str());
+			for (const VolumeStatus *v : matches)
+				fprintf(stderr, "  %s  (%s)\n", v->uuid.c_str(), v->disk.c_str());
+			return 1;
+		}
+	}
 	if (uuid.empty())
 	{
 		fprintf(stderr, "no volume '%s' (see winapfs ctl list)\n", want.c_str());
@@ -1360,7 +1655,7 @@ int CmdCtl(const std::vector<std::wstring> &args)
 		if (args.size() >= 4 && args[2] == L"--password")
 			req += "\t" + WideToUtf8(args[3]);
 	}
-	else if (cmd == "unmount" || cmd == "eject")
+	else if (cmd == "unmount" || cmd == "eject" || cmd == "verify")
 		req = cmd + "\t" + uuid;
 	else if (cmd == "set" && args.size() >= 4)
 		req = "set\t" + uuid + "\t" + WideToUtf8(args[2]) + "\t" + WideToUtf8(args[3]);
@@ -1372,6 +1667,20 @@ int CmdCtl(const std::vector<std::wstring> &args)
 	{
 		fprintf(stderr, "%s\n", err.c_str());
 		return 1;
+	}
+	if (cmd == "verify")
+	{
+		int fsck_code = 0;
+		for (const auto &l : lines)
+		{
+			if (l.compare(0, 5, "exit\t") == 0)
+				fsck_code = std::atoi(l.c_str() + 5);
+			else
+				printf("%s\n", l.c_str());
+		}
+		if (fsck_code == 0)
+			printf("ok\n");
+		return fsck_code ? 1 : 0;
 	}
 	printf("ok\n");
 	return 0;

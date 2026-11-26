@@ -35,8 +35,8 @@
     <Launch Condition="Installed OR WINFSPDIR"
             Message="winapfs needs WinFsp (Windows File System Proxy). Install it from https://winfsp.dev, or use winapfs-setup.exe, which installs both." />
 
-    <Property Id="ARPURLINFOABOUT" Value="https://github.com/christofilojohn/winapfs" />
-    <Property Id="ARPHELPLINK" Value="https://github.com/christofilojohn/winapfs/issues" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/FOLKGG/winapfs" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/FOLKGG/winapfs/issues" />
     <!-- the logo in Settings > Apps and on the Start-menu shortcut -->
     <Icon Id="WinapfsIcon" SourceFile="$(sys.SOURCEFILEDIR)..\assets\winapfs.ico" />
     <Property Id="ARPPRODUCTICON" Value="WinapfsIcon" />

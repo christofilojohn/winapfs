@@ -35,7 +35,7 @@ static void Usage()
 		"  winapfs mount <image|\\\\.\\PhysicalDriveN> [X:|dir|*] [options]\n"
 		"  winapfs mount-all [<image|\\\\.\\PhysicalDriveN>...] [options]\n"
 		"  winapfs service install|uninstall|start|stop|status|config|debug   (see winapfs service)\n"
-		"  winapfs ctl list|mount|unmount|eject|set|rescan   control the service (see winapfs ctl)\n"
+		"  winapfs ctl list|mount|unmount|eject|verify|set|rescan   control the service (see winapfs ctl)\n"
 		"\n"
 		"Without a source, list and mount-all scan every physical disk for APFS\n"
 		"partitions (GPT type 7C3457EF-0000-11AA-AA11-00306543ECAC). Raw disk access\n"
