@@ -270,12 +270,16 @@ int apfsrw_rename(apfsrw_node *olddir_node, const char *oldname, size_t oldlen,
 			err = -EISDIR;
 		else if (S_ISDIR(src->i_mode) && odi != ndi && is_ancestor(src, ndi))
 			err = -EINVAL;	/* into its own subtree */
-		else if (tgt == src && (odi != ndi || apfs_filename_cmp(odi->i_sb, oldname, (unsigned int)oldlen, newname, (unsigned int)newlen) != 0))
+		else if (tgt == src)
 			noop = true;	/* another link to the same inode (POSIX: no-op) */
 	}
 	/*
-	 * A case-only rename on a case-insensitive volume finds the source
-	 * itself as the target; the driver handles that as a plain rename.
+	 * A case-only rename on a case-insensitive volume also finds the source
+	 * itself as the target, and stays a no-op: apfs_rename unlinks the
+	 * target first, which here is the source (Linux's vfs_rename never calls
+	 * ->rename with old == new inode), so it would drop both names, orphan
+	 * the inode twice and delete the file. Renaming the stored case needs
+	 * its own driver path.
 	 */
 	if (!err && !noop) {
 		inode_lock(src);
