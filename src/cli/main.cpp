@@ -77,13 +77,15 @@ static std::string FormatEntry(Volume &vol, const std::string &display, const Di
 		Stat st;
 		char buf[160];
 		if (vol.GetStat(e.inode, st))
+		{
 			snprintf(buf, sizeof(buf), "%10llu %06o %3llu %12llu %s ", static_cast<unsigned long long>(st.inode), st.mode,
 				static_cast<unsigned long long>(st.nlink), static_cast<unsigned long long>(st.size), FormatTime(st.mod_ns).c_str());
-		if (g_show_flags && vol.GetStat(e.inode, st))
-		{
-			char fb[48];
-			snprintf(fb, sizeof(fb), "bsd=%08x int=%08llx ", st.bsd_flags, static_cast<unsigned long long>(st.internal_flags));
-			strcat_s(buf, fb);
+			if (g_show_flags)
+			{
+				char fb[48];
+				snprintf(fb, sizeof(fb), "bsd=%08x int=%08llx ", st.bsd_flags, static_cast<unsigned long long>(st.internal_flags));
+				strcat_s(buf, fb);
+			}
 		}
 		else
 			snprintf(buf, sizeof(buf), "%10llu ?????? ? ? ? ", static_cast<unsigned long long>(e.inode));

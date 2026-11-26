@@ -1,0 +1,257 @@
+name: macOS fsck_apfs Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/kshim/**'
+      - 'src/core/**'
+      - 'src/mount/**'
+      - 'src/tray/**'
+      - 'third_party/linux-apfs-rw/**'
+      - 'tests/**'
+      - '.github/workflows/fsck-apfs.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  generate-images:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate real macOS APFS images and manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x testdata/generator/*.sh
+          bash testdata/generator/make_images.sh
+          ls -lh testdata/generator/images
+          tar -czf apfs-test-images.tar.gz -C testdata/generator/images .
+          ls -lh apfs-test-images.tar.gz
+
+      - name: Upload generated APFS images
+        uses: actions/upload-artifact@v4
+        with:
+          name: apfs-test-images
+          path: apfs-test-images.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  winapfs-write:
+    runs-on: windows-2022
+    needs: generate-images
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download generated APFS images
+        uses: actions/download-artifact@v4
+        with:
+          name: apfs-test-images
+
+      - name: Extract test images into testdata
+        run: |
+          tar -xzf apfs-test-images.tar.gz -C testdata
+          if ($LASTEXITCODE -ne 0) { throw "Failed to extract apfs-test-images.tar.gz" }
+          Remove-Item apfs-test-images.tar.gz -Force
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,2)}}
+
+      - name: Install WinFsp SDK
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp-2.2.26323.msi'
+          Invoke-WebRequest -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.2/winfsp-2.2.26323.msi' -OutFile $msi
+          $proc = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i', $msi, '/qn', 'ADDLOCAL=ALL'
+          if ($proc.ExitCode -notin 0, 3010) {
+            throw "WinFsp installation failed with exit code $($proc.ExitCode)"
+          }
+
+      - name: Build Release (x64)
+        run: |
+          cmd /c build.cmd Release
+          if ($LASTEXITCODE -ne 0) { throw "build.cmd Release failed ($LASTEXITCODE)" }
+
+      - name: Run full staged ctest suite and collect written images
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          $stages = @(
+            '^(unit|image|cli|mount\.|mount_all|rawdev|mount_rawdev|rwengine|mount_case|mount_lib|mount_dotfiles|fsck)',
+            '^(write\.|write_fsck|mountwrite)',
+            '^(crash|diskfull|prealloc|dirquery|concurrent)',
+            '^w5_',
+            '^service\.',
+            '^(pagecache|inodecache)'
+          )
+          $allNames = @(& ctest --test-dir build -C Release -N | ForEach-Object { if ($_ -match '^\s*Test\s+#\d+:\s+(\S+)') { $Matches[1] } })
+          Write-Output "Total discovered CTest tests: $($allNames.Count)"
+          if ($allNames.Count -lt 100) { throw "Expected full test suite (~150 tests), found $($allNames.Count)" }
+          $uncovered = @($allNames | Where-Object { $n = $_; -not ($stages | Where-Object { $n -match $_ }) })
+          if ($uncovered.Count -gt 0) {
+            throw "Uncovered tests in stages: $($uncovered -join ', ')"
+          }
+
+          $cleanups = @(
+            { Remove-Item 'build\tests\corrupt-*.img' -Force -ErrorAction SilentlyContinue },
+            {
+              foreach ($pair in @(
+                @('w32-basic.img', 'basic.written.img'),
+                @('w32-compressed.img', 'compressed.written.img'),
+                @('w32-links.img', 'links.written.img'),
+                @('w32-casesensitive.img', 'casesensitive.written.img'),
+                @('w32-multivol.img', 'multivol.written.img')
+              )) {
+                $src = Join-Path 'build\tests' $pair[0]
+                if (-not (Test-Path $src)) { throw "Missing expected WinFsp-written image: $src" }
+                Move-Item $src (Join-Path 'out' $pair[1]) -Force
+              }
+              Remove-Item 'build\tests\w3-*.img', 'build\tests\w32-*.img' -Force -ErrorAction SilentlyContinue
+            },
+            {
+              foreach ($pair in @(
+                @('conc-compressed.img', 'conc-compressed.written.img'),
+                @('crash-basic.img', 'crash-basic.written.img'),
+                @('full-basic.img', 'full-basic.written.img')
+              )) {
+                $src = Join-Path 'build\tests' $pair[0]
+                if (-not (Test-Path $src)) { throw "Missing $src" }
+                Move-Item $src (Join-Path 'out' $pair[1]) -Force
+              }
+              Remove-Item 'build\tests\crash-*.img*', 'build\tests\full-*.img*', 'build\tests\prealloc-*.img', 'build\tests\dirquery-*.img' -Force -ErrorAction SilentlyContinue
+            },
+            {
+              $mv = 'build\tests\w5-multivol.img'
+              if (-not (Test-Path $mv)) { throw "Missing $mv" }
+              Move-Item $mv 'out\w5-multivol.written.img' -Force
+              Remove-Item 'build\tests\unclean-*.img*', 'build\tests\w5raw-*.img*', 'build\tests\w5-multivol.img' -Force -ErrorAction SilentlyContinue
+            },
+            { Remove-Item 'build\tests\svc-*.img', 'build\tests\ctl-*.img' -Force -ErrorAction SilentlyContinue },
+            { Remove-Item 'build\tests\pagecache-*.img', 'build\tests\inodecache-*.img' -Force -ErrorAction SilentlyContinue }
+          )
+
+          for ($i = 0; $i -lt $stages.Count; $i++) {
+            $rx = $stages[$i]
+            Write-Output "========================================"
+            Write-Output "Stage $($i + 1)/$($stages.Count): ctest -R '$rx'"
+            Write-Output "========================================"
+            & ctest --test-dir build -C Release -R $rx --output-on-failure --timeout 300
+            if ($LASTEXITCODE -ne 0) { throw "CTest stage $($i + 1) failed ($LASTEXITCODE)" }
+            & $cleanups[$i]
+            $freeGB = [math]::Round((Get-PSDrive D -ErrorAction SilentlyContinue).Free / 1GB, 2)
+            Write-Output "Stage $($i + 1) complete (D: free = $freeGB GB)"
+          }
+
+          tar -czf apfs-written-images.tar.gz -C out .
+          if ($LASTEXITCODE -ne 0) { throw "Failed to pack apfs-written-images.tar.gz" }
+
+      - name: Upload winapfs-written APFS images
+        uses: actions/upload-artifact@v4
+        with:
+          name: apfs-written-images
+          path: apfs-written-images.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  macos-fsck:
+    runs-on: macos-latest
+    needs: winapfs-write
+    steps:
+      - name: Download winapfs-written APFS images
+        uses: actions/download-artifact@v4
+        with:
+          name: apfs-written-images
+
+      - name: Verify written images with Apple fsck_apfs, full-tree read, and macOS RW round-trip
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d -t winapfs-fsck)"
+          DISK=""
+          cleanup() {
+            [[ -n "$DISK" ]] && hdiutil detach -force "$DISK" >/dev/null 2>&1 || true
+            rm -rf "$WORK"
+          }
+          trap cleanup EXIT
+          mkdir -p written
+          tar -xzf apfs-written-images.tar.gz -C written
+
+          run_fsck() {
+            local img="$1"
+            local out
+            out=$(hdiutil attach -nomount -readonly -imagekey diskimage-class=CRawDiskImage "$img")
+            echo "$out"
+            DISK=$(awk '$2 == "GUID_partition_scheme" {print $1; exit}' <<<"$out")
+            [[ -n "$DISK" ]] || DISK=$(awk 'NR==1{print $1}' <<<"$out")
+            CONT=$(awk 'toupper($2) ~ /^EF57347C-0000-11AA-AA11/ {print $1; exit}' <<<"$out")
+            [[ -n "$CONT" ]] || CONT=$(awk 'toupper($2) == "APPLE_APFS" {print $1; exit}' <<<"$out")
+            [[ -n "$CONT" ]] || { echo "ERROR: No APFS container found in $img"; exit 1; }
+            echo "Container device: $CONT (disk: $DISK)"
+            fsck_apfs -n -l "$CONT"
+            hdiutil detach -quiet "$DISK"; DISK=""
+          }
+
+          for img in written/*.written.img; do
+            echo "========================================"
+            echo "1) Apple fsck_apfs -n -l (pre-roundtrip): $img"
+            echo "========================================"
+            run_fsck "$img"
+
+            echo "2) macOS read-write mount, full-tree checksum read, and RW round-trip: $img"
+            mnt="$WORK/mnt-$(basename "$img" .written.img)"
+            mkdir -p "$mnt"
+            out=$(hdiutil attach -nobrowse -readwrite -mountroot "$mnt" -imagekey diskimage-class=CRawDiskImage "$img")
+            DISK=$(awk '$2 == "GUID_partition_scheme" {print $1; exit}' <<<"$out")
+            [[ -n "$DISK" ]] || DISK=$(awk 'NR==1{print $1}' <<<"$out")
+            vol_dirs=$(find "$mnt" -mindepth 1 -maxdepth 1 -type d)
+            [[ -n "$vol_dirs" ]] || { echo "ERROR: Failed to mount $img read-write on macOS"; exit 1; }
+            while IFS= read -r vol_dir; do
+              echo "Reading all regular files in $(basename "$vol_dir")..."
+              python3 - "$vol_dir" <<'PY'
+          import hashlib, os, sys
+          root = sys.argv[1]
+          count = 0
+          total_bytes = 0
+          for dirpath, dirnames, filenames in os.walk(root):
+              dirnames[:] = [d for d in dirnames if d not in ('.Trashes', '.fseventsd', '.Spotlight-V100')]
+              for name in filenames:
+                  p = os.path.join(dirpath, name)
+                  if os.path.islink(p) or not os.path.isfile(p):
+                      continue
+                  h = hashlib.sha256()
+                  with open(p, 'rb') as f:
+                      while True:
+                          buf = f.read(1 << 20)
+                          if not buf:
+                              break
+                          h.update(buf)
+                          total_bytes += len(buf)
+                  count += 1
+          print(f"Verified {count} regular files ({total_bytes} bytes) readable on macOS")
+          PY
+
+              rt="$vol_dir/.macos-rt"
+              mkdir -p "$rt"
+              head -c 16384 /dev/urandom > "$rt/blob.bin"
+              want=$(shasum -a 256 "$rt/blob.bin" | awk '{print $1}')
+              printf 'winapfs-macos-roundtrip\n' > "$rt/note.txt"
+              mv "$rt/note.txt" "$rt/note-renamed.txt"
+              printf 'appended\n' >> "$rt/note-renamed.txt"
+              got=$(shasum -a 256 "$rt/blob.bin" | awk '{print $1}')
+              [[ "$want" == "$got" ]] || { echo "ERROR: macOS round-trip SHA-256 mismatch on $vol_dir"; exit 1; }
+              rm -f "$rt/blob.bin"
+              echo "macOS RW round-trip OK in $(basename "$vol_dir")"
+            done <<<"$vol_dirs"
+            sync
+            hdiutil detach -quiet "$DISK"; DISK=""
+
+            echo "3) Apple fsck_apfs -n -l (post-roundtrip): $img"
+            run_fsck "$img"
+          done
+          echo "All winapfs-written APFS images passed full-tree read, macOS RW round-trip, and double Apple fsck_apfs!"

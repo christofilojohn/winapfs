@@ -12,6 +12,7 @@
 
 #include <apfsrw.h>
 
+#include <atomic>
 #include <list>
 #include <mutex>
 #include <unordered_map>
@@ -319,6 +320,8 @@ public:
 	// ---------------------------------------------------------------- writing
 
 	bool Writable() const override { return apfsrw_is_readwrite(m_mount); }
+	bool IoFailed() const override { return apfsrw_io_failed(m_mount); }
+	uint64_t DecompressGen() const override { return m_decompress_gen.load(std::memory_order_acquire); }
 
 	int Create(uint64_t parent, const std::string &name, bool dir, uint32_t mode, DirEntry &out) override
 	{
@@ -506,8 +509,21 @@ private:
 	int Decompressed(uint64_t &inode)
 	{
 		Stat st;
-		if (!GetStat(inode, st) || !st.compressed)
+		if (!GetStat(inode, st))
+			return -2;
+		if (!st.compressed)
+		{
+			inode = st.inode;
 			return 0;
+		}
+		std::lock_guard<std::mutex> dlock(m_decompress_mutex);
+		if (!GetStat(inode, st))
+			return -2;
+		if (!st.compressed)
+		{
+			inode = st.inode;
+			return 0;
+		}
 		NodeRef p = Get(st.parent);
 		std::vector<DirEntry> ents;
 		if (!p || !ListDir(st.parent, ents))
@@ -529,12 +545,38 @@ private:
 			apfsrw_put(n);
 			return err;
 		}
-		Remember(s.ino, n);
-		apfsrw_node *old = Drop(st.inode);   // the replaced inode can go
-		if (old)
-			apfsrw_put(old);
-		std::lock_guard<std::mutex> lock(m_mutex);
-		m_alias[st.inode] = s.ino;
+		std::vector<apfsrw_node *> to_put;
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			m_alias[st.inode] = s.ino;
+			if (s.ino == kRootInode || m_nodes.count(s.ino))
+			{
+				to_put.push_back(n);
+			}
+			else
+			{
+				m_lru.push_back(s.ino);
+				m_nodes[s.ino] = Entry{ n, std::prev(m_lru.end()) };
+				while (m_nodes.size() > kMaxNodes)
+				{
+					uint64_t ev = m_lru.front();
+					m_lru.pop_front();
+					auto eit = m_nodes.find(ev);
+					to_put.push_back(eit->second.node);
+					m_nodes.erase(eit);
+				}
+			}
+			auto oit = m_nodes.find(st.inode);
+			if (oit != m_nodes.end())
+			{
+				to_put.push_back(oit->second.node);
+				m_lru.erase(oit->second.lru);
+				m_nodes.erase(oit);
+			}
+			m_decompress_gen.fetch_add(1, std::memory_order_release);
+		}
+		for (apfsrw_node *pnode : to_put)
+			apfsrw_put(pnode);
 		inode = s.ino;
 		return 0;
 	}
@@ -666,6 +708,8 @@ private:
 	apfsrw_mount *m_mount;
 	apfsrw_node *m_root = nullptr;
 	std::mutex m_mutex;
+	std::mutex m_decompress_mutex;
+	std::atomic<uint64_t> m_decompress_gen{ 0 };
 	std::unordered_map<uint64_t, Entry> m_nodes;
 	std::list<uint64_t> m_lru;   // least recently used first
 	std::unordered_map<uint64_t, uint64_t> m_alias;   // decompressed: old inode -> new

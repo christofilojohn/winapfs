@@ -6,7 +6,25 @@
 
 #include <Windows.h>
 
+#include <cstdlib>
+#include <utility>
+
 namespace winapfs {
+
+static void SecureClear(std::string &s)
+{
+	if (!s.empty())
+	{
+		SecureZeroMemory(&s[0], s.size());
+		s.clear();
+	}
+}
+
+struct SecretStringGuard
+{
+	std::string &s;
+	~SecretStringGuard() { SecureClear(s); }
+};
 
 const wchar_t *const kServicePipe = L"\\\\.\\pipe\\winapfs";
 const wchar_t *const kDebugPipe = L"\\\\.\\pipe\\winapfs-debug";
@@ -69,6 +87,7 @@ int ControlRequest(const std::wstring &pipe, const std::string &request, std::ve
 	SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
 	DWORD done = 0;
 	std::string req = request + "\n";
+	SecretStringGuard req_guard{ req };
 	if (!WriteFile(h, req.data(), static_cast<DWORD>(req.size()), &done, nullptr))
 	{
 		err = "cannot send the request (error " + std::to_string(GetLastError()) + ")";
@@ -125,7 +144,23 @@ bool ControlList(const std::wstring &pipe, std::vector<VolumeStatus> &vols, bool
 	{
 		std::vector<std::string> f = SplitTabs(l);
 		if (f.size() >= 8 && f[0] == "vol")
-			vols.push_back(VolumeStatus{ f[1], f[2], f[3], f[4], f[5], f[6], f[7] });
+		{
+			VolumeStatus vs;
+			vs.uuid = f[1];
+			vs.name = f[2];
+			vs.state = f[3];
+			vs.letter = f[4];
+			vs.mode = f[5];
+			vs.disk = f[6];
+			vs.note = f[7];
+			if (f.size() >= 9)
+				vs.hide_dotfiles = f[8] != "0";
+			if (f.size() >= 10)
+				vs.read_bytes = std::strtoull(f[9].c_str(), nullptr, 10);
+			if (f.size() >= 11)
+				vs.write_bytes = std::strtoull(f[10].c_str(), nullptr, 10);
+			vols.push_back(std::move(vs));
+		}
 		else if (f.size() >= 3 && f[0] == "cfg" && f[1] == "AllowDiskWrites")
 			allow_disk_writes = f[2] == "1";
 	}

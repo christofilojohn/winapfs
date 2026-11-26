@@ -15,7 +15,7 @@
 
 struct apfsrw_file {
 	struct file f;
-	/* readahead hints (apfsrw_read); racy updates only cost an extra or a missed readahead */
+	struct mutex ra_lock;	/* protects readahead hints (ra_next / ra_end) */
 	u64 ra_next;	/* where a sequential reader continues */
 	u64 ra_end;	/* bytes before this were read ahead already */
 };

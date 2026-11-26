@@ -886,6 +886,8 @@ void deactivate_locked_super(struct super_block *sb)
 		if (sb->s_type->kill_sb)
 			sb->s_type->kill_sb(sb);
 		cancel_work_sync(&sb->kshim_evict_work);
+		free(sb->kshim_evict_work.kshim);
+		sb->kshim_evict_work.kshim = NULL;
 		free(sb->kshim_icache);
 		free(sb->s_bdi);
 		free(sb);

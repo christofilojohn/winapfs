@@ -1,15 +1,17 @@
-# winapfs - build the MSI (WiX 5: winget install WiXToolset.WiXCLI --version 5.0.2.0,
-# then: wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2)
+# winapfs - build the MSI and optional Burn setup bundle (WiX 5: winget install WiXToolset.WiXCLI --version 5.0.2.0,
+# then: wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2 WixToolset.BootstrapperApplications.wixext/5.0.2)
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-#   powershell -ExecutionPolicy Bypass -File installer\build.ps1 [-Build build] [-Out dist]
+#   powershell -ExecutionPolicy Bypass -File installer\build.ps1 [-Build build] [-Out dist] [-WinFspMsi path\to\winfsp.msi]
 #
-# Needs a Release build. Writes dist\winapfs-<version>-x64.msi.
+# Needs a Release build. Writes dist\winapfs-<version>-x64.msi, and when
+# -WinFspMsi is passed, also writes dist\winapfs-<version>-x64-setup.exe.
 
 param(
 	[string]$Build = "$PSScriptRoot\..\build",
 	[string]$Out = "$PSScriptRoot\..\dist",
-	[string]$Version = ''   # default: the CMakeLists.txt project version
+	[string]$Version = '',   # default: the CMakeLists.txt project version
+	[string]$WinFspMsi = ''  # optional: path to WinFsp MSI to build the Burn setup.exe bundle
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path "$PSScriptRoot\..").Path
@@ -73,3 +75,14 @@ $msi = "$Out\winapfs-$version-x64.msi"
 	-d "Version=$version" -d "BuildDir=$Build" -d "ObjDir=$obj" -o $msi
 if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
 Write-Output "built $msi ($([int]((Get-Item $msi).Length / 1KB)) KiB)"
+
+if ($WinFspMsi) {
+	if (-not (Test-Path $WinFspMsi)) { throw "WinFsp MSI not found: $WinFspMsi" }
+	$winfspResolved = (Resolve-Path $WinFspMsi).Path
+	$msiResolved = (Resolve-Path $msi).Path
+	$setup = "$Out\winapfs-$version-x64-setup.exe"
+	& $wix build "$PSScriptRoot\bundle.wxs" -arch x64 -ext WixToolset.BootstrapperApplications.wixext `
+		-d "Version=$version" -d "WinFspMsi=$winfspResolved" -d "WinapfsMsi=$msiResolved" -d "ObjDir=$obj" -o $setup
+	if ($LASTEXITCODE -ne 0) { throw "wix bundle build failed" }
+	Write-Output "built $setup ($([int]((Get-Item $setup).Length / 1KB)) KiB)"
+}
